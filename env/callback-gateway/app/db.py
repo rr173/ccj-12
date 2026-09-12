@@ -4,10 +4,12 @@
 - deliveries       每一次回调内容的一个版本（同一 external_id 可有多份不同内容）
 - conflicts        同编号不同内容产生的冲突单
 - conflict_members 冲突单与内容版本的关联
-- outbox           外部副作用的发件箱（幂等键保证 exactly-once）
+- outbox           外部副作用的发件箱（幂等键保证 exactly-once；replay_task_id 标识重放产生的行）
 - sink_effects     模拟下游系统的已应用记录（下游按幂等键去重）
-- events           只增不删的审计日志（签名/冲突/重试/处置全部可查）
+- events           只增不删的审计日志（签名/冲突/重试/处置/重放全部可查）
 - key_config_versions  密钥配置每次切换/尝试的记录（版本、操作者、时间、结果）
+- replay_batches   重放批次：一次提交的一组重放任务（发起人、原因、筛选快照、进度）
+- replay_tasks     单条重放任务：原始版本、状态机、重试位置（checkpoint），批内按内容去重
 """
 from __future__ import annotations
 
@@ -52,6 +54,7 @@ CREATE TABLE IF NOT EXISTS conflict_members (
 CREATE TABLE IF NOT EXISTS outbox (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     delivery_id     INTEGER NOT NULL REFERENCES deliveries(id),
+    replay_task_id  INTEGER REFERENCES replay_tasks(id),  -- NULL=正常处理；否则为重放产生的副作用
     effect_type     TEXT NOT NULL,
     idempotency_key TEXT NOT NULL UNIQUE,      -- 幂等键：重启/重复投递不重复执行
     payload         TEXT NOT NULL,
@@ -61,6 +64,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     created_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
+CREATE INDEX IF NOT EXISTS idx_outbox_replay_task ON outbox(replay_task_id);
 
 -- 模拟“下游系统”的已应用效果表：下游凭幂等键去重，是 exactly-once 的最后一道保险
 CREATE TABLE IF NOT EXISTS sink_effects (
@@ -91,6 +95,45 @@ CREATE TABLE IF NOT EXISTS key_config_versions (
     reason      TEXT,                  -- rejected 的校验失败原因（JSON 数组）
     created_at  REAL NOT NULL
 );
+
+-- 重放批次：运营一次提交的一组重放任务
+CREATE TABLE IF NOT EXISTS replay_batches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id  TEXT UNIQUE,           -- 提交幂等键：重复提交返回原批次，不生成第二批任务
+    operator    TEXT NOT NULL,         -- 发起人
+    reason      TEXT NOT NULL,         -- 重放原因
+    status      TEXT NOT NULL DEFAULT 'running',  -- running|paused|completed|completed_with_failures|cancelled
+    filters     TEXT NOT NULL DEFAULT '{}',       -- 提交时的筛选条件快照（可追溯）
+    total       INTEGER NOT NULL DEFAULT 0,       -- 进度：任务总数 / 各终态计数
+    done        INTEGER NOT NULL DEFAULT 0,
+    failed      INTEGER NOT NULL DEFAULT 0,
+    cancelled   INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    finished_at REAL
+);
+
+-- 单条重放任务：每条都记录发起人、原始版本（delivery_id）、原因和进度
+CREATE TABLE IF NOT EXISTS replay_tasks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id      INTEGER NOT NULL REFERENCES replay_batches(id),
+    delivery_id   INTEGER NOT NULL REFERENCES deliveries(id),  -- 原始版本（内容不复制，引用落盘原文）
+    external_id   TEXT NOT NULL,
+    operator      TEXT NOT NULL,       -- 发起人（冗余到每条，单条可查）
+    reason        TEXT NOT NULL,       -- 原因（冗余到每条）
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|processing|done|failed|cancelled
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    next_retry_at REAL,                -- 下次可重试时间（epoch 秒），NULL 表示立即可执行
+    checkpoint    TEXT,                -- JSON：处理位置快照，重启后从这里继续
+    last_error    TEXT,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    finished_at   REAL,
+    UNIQUE (batch_id, delivery_id)     -- 同一份内容在同一批里只生成一个重放任务
+);
+CREATE INDEX IF NOT EXISTS idx_replay_tasks_pick ON replay_tasks(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_replay_tasks_batch ON replay_tasks(batch_id);
+CREATE INDEX IF NOT EXISTS idx_replay_tasks_active ON replay_tasks(delivery_id, status);
 """
 
 
@@ -105,7 +148,19 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=FULL")   # 提交即落盘，ACK 才可靠
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self._migrate()   # 先补旧库的列，再建表（SCHEMA 里的索引依赖新列）
             self._conn.executescript(SCHEMA)
+
+    def _migrate(self):
+        """对老版本数据库就地补列（新库由 SCHEMA 直接建出完整结构，这里自动跳过）。"""
+        tables = {r["name"] for r in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "outbox" in tables:
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(outbox)")}
+            if cols and "replay_task_id" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE outbox ADD COLUMN replay_task_id INTEGER "
+                    "REFERENCES replay_tasks(id)")
 
     @contextmanager
     def tx(self):

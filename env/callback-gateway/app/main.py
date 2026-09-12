@@ -3,7 +3,8 @@
 分层：
 - 接入（本文件 POST /callbacks）：验签 -> 落盘 -> 确认，不做任何业务处理；
 - 处理（worker.py 后台任务）：重试、隔离、副作用派发；
-- 人工处置（admin.py）：冲突比较/选定、隔离重投、审计查询。
+- 人工处置（admin.py）：冲突比较/选定、隔离重投、审计查询；
+- 业务重放（replay.py）：筛选预览 -> 批量提交 -> 暂停/继续/取消 -> 审计查询。
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from .config import Settings
 from .db import Database
 from .ingest import ingest
 from .keyconfig import KeyConfigStore, KeyRotationService
+from .replay import ReplayWorker, create_replay_router
 from .security import KeyRingManager
 from .worker import Worker
 
@@ -33,15 +35,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         key_store.bootstrap(settings.keys_file, settings.signature_tolerance_seconds))
     keys = KeyRotationService(key_store, keyring)
     worker = Worker(db, settings)
+    replay_worker = ReplayWorker(db, settings)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
-        task = None
+        # 重启恢复：上次未完成（卡在 processing）的重放任务退回待处理，从上次位置继续
+        replay_worker.recover()
+        tasks = []
         if settings.run_worker:
-            task = asyncio.create_task(worker.run_forever())
+            tasks.append(asyncio.create_task(worker.run_forever()))
+            tasks.append(asyncio.create_task(replay_worker.run_forever()))
         yield
-        if task is not None:
-            worker.stop()
+        worker.stop()
+        replay_worker.stop()
+        for task in tasks:
             await task
         db.close()
 
@@ -50,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.keyring = keyring
     app.state.keys = keys
     app.state.worker = worker
+    app.state.replay_worker = replay_worker
     app.state.settings = settings
 
     @app.post("/callbacks")
@@ -80,6 +88,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok", "time": time.time()}
 
     app.include_router(create_admin_router(db, keys))
+    app.include_router(create_replay_router(db))
     return app
 
 

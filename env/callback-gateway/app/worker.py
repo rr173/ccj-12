@@ -141,10 +141,18 @@ class Worker:
     # 只有「已处理完成且未被冻结」的版本才允许产生外部效果：
     # 冲突冻结期间整组暂停派发；人工选定后未选中版本被 superseded/cancelled，
     # 其滞留的副作用永不再发 —— 只有被选中的版本继续执行。
+    # 重放产生的副作用（replay_task_id 非空）走同一条幂等派发链路：
+    # 任务完成且批次未暂停/取消才放行，暂停期间滞留，取消时已被置 cancelled。
     _DISPATCHABLE_SQL = """
-        SELECT o.* FROM outbox o
+        SELECT o.*, t.batch_id AS replay_batch_id FROM outbox o
         JOIN deliveries d ON d.id = o.delivery_id
-        WHERE o.status='pending' AND d.frozen=0 AND d.status='done'
+        LEFT JOIN replay_tasks t ON t.id = o.replay_task_id
+        LEFT JOIN replay_batches b ON b.id = t.batch_id
+        WHERE o.status='pending' AND (
+            (o.replay_task_id IS NULL AND d.frozen=0 AND d.status='done')
+            OR (o.replay_task_id IS NOT NULL AND t.status='done'
+                AND b.status NOT IN ('paused','cancelled'))
+        )
         ORDER BY o.id LIMIT 100"""
 
     def _dispatch_outbox(self):
@@ -155,11 +163,18 @@ class Worker:
     def _dispatch_one(self, row):
         now = self.clock()
         key = row["idempotency_key"]
-        # 发送前复查：拉取之后行可能已被人工处置取消，或所属版本被冻结/取代
+        # 发送前复查：拉取之后行可能已被人工处置取消，或所属版本被冻结/取代，
+        # 或所属重放批次被暂停/取消
         still_valid = self.db.query_one(
             """SELECT 1 AS x FROM outbox o
                JOIN deliveries d ON d.id = o.delivery_id
-               WHERE o.id=? AND o.status='pending' AND d.frozen=0 AND d.status='done'""",
+               LEFT JOIN replay_tasks t ON t.id = o.replay_task_id
+               LEFT JOIN replay_batches b ON b.id = t.batch_id
+               WHERE o.id=? AND o.status='pending' AND (
+                   (o.replay_task_id IS NULL AND d.frozen=0 AND d.status='done')
+                   OR (o.replay_task_id IS NOT NULL AND t.status='done'
+                       AND b.status NOT IN ('paused','cancelled'))
+               )""",
             (row["id"],),
         )
         if still_valid is None:
@@ -178,7 +193,8 @@ class Worker:
                 )
                 audit.record(cur, "effect_failed", None, row["delivery_id"],
                              {"outbox_id": row["id"], "attempts": attempts,
-                              "status": status, "error": str(exc)}, ts=now)
+                              "status": status, "error": str(exc),
+                              **self._replay_ref(row)}, ts=now)
             return
         with self.db.tx() as cur:
             cur.execute(
@@ -187,4 +203,13 @@ class Worker:
             )
             audit.record(cur, "effect_executed", None, row["delivery_id"],
                          {"outbox_id": row["id"], "idempotency_key": key,
-                          "effect_type": row["effect_type"]}, ts=now)
+                          "effect_type": row["effect_type"],
+                          **self._replay_ref(row)}, ts=now)
+
+    @staticmethod
+    def _replay_ref(row) -> dict:
+        """重放产生的副作用在审计里带上批次/任务号，可按批次查完整轨迹。"""
+        if row["replay_task_id"] is None:
+            return {}
+        return {"replay_task_id": row["replay_task_id"],
+                "replay_batch_id": row["replay_batch_id"]}

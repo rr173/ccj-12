@@ -17,6 +17,10 @@
                 ┌──────────────▼─────────────────────────────────────┐
                 │ 人工处置层  /admin/*                                │
                 │   冲突比较/选定续跑、隔离重投、全量审计查询          │
+                ├────────────────────────────────────────────────────┤
+                │ 业务重放层  /admin/replays/*                        │
+                │   筛选预览 → 批量提交 → 暂停/继续/取消 → 审计查询    │
+                │   重放副作用走同一 outbox 幂等链路                   │
                 └────────────────────────────────────────────────────┘
 ```
 
@@ -34,6 +38,14 @@
 | 人工选定后从可追溯位置继续 | 选定版本保留 `checkpoint` 与 `attempts` 历史，解冻续跑；全程写 `events` 审计 |
 | 只有被选中的版本继续产生外部效果 | 派发器只发「done 且未冻结」版本的 outbox；处置时未选中版本滞留的待派发副作用同事务取消（`cancelled`）并记审计，见 `app/worker.py`、`app/admin.py` |
 | 查询签名/冲突/重试/处置记录 | `GET /admin/events`（只增不删的审计表） |
+| 按编号/时间/处理结果筛选历史回调，先预览再提交 | `POST /admin/replays/preview` 与 `POST /admin/replays` 共用同一套筛选，看到的就是将要提交的，见 `app/replay.py` |
+| 每条重放记录发起人、原始版本、原因、进度 | `replay_tasks` 逐条冗余 operator/reason/delivery_id，状态机 + attempts + checkpoint 即进度 |
+| 同一份内容重复加入不生成第二个重放任务 | 批内 `UNIQUE(batch_id, delivery_id)`；`request_id` 重复提交返回原批次；跨批存在活动任务的投递自动跳过 |
+| 重放可暂停/继续/取消 | `POST /admin/replays/{id}/pause|resume|cancel`；取消时未执行任务与滞留副作用同事务取消 |
+| 重启后未完成任务从上次位置继续 | 启动时 `ReplayWorker.recover()` 把卡在 processing 的任务退回 pending，attempts/checkpoint 都在库里 |
+| 失败单独重试、不阻塞其他编号 | 任务级指数退避，超限标记 `failed`，`POST /admin/replays/tasks/{id}/retry` 单条重试 |
+| 重放副作用与正常处理同样的幂等保护 | 重放副作用落同一 `outbox`（`replay_task_id` 标识），幂等键以 `replay:{task_id}` 为作用域，同一派发器 + 下游去重 |
+| 每次重放的完整审计记录 | `GET /admin/replays/{id}/events`（可按单条任务过滤） |
 | Docker 部署 | `Dockerfile` + `docker-compose.yml` |
 
 ## 快速开始
@@ -47,7 +59,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 32 个端到端测试
+python -m pytest tests/          # 49 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -126,6 +138,56 @@ curl 'localhost:8000/admin/events?type=retry_scheduled'
 curl 'localhost:8000/admin/events?external_id=A-1001'
 ```
 
+## 业务重放
+
+运营按编号、时间、处理结果筛选历史回调，**先预览内容和影响范围，再一次性提交一批
+重放任务**。每条重放记录发起人、原始版本、原因和进度；全程可暂停/继续/取消，
+重启后未完成的任务从上次位置继续。
+
+```bash
+# 1) 预览：将要重放的内容 + 影响范围（该版本正常处理时产出过的外部副作用）
+#    筛选条件：external_id / status / created_from / created_to（epoch 秒或 ISO-8601）/ delivery_ids
+curl -X POST localhost:8000/admin/replays/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"external_id": "A-1001", "status": "done"}'
+# -> {"matched": 1, "replayable": 1, "items": [{"delivery_id": 1, "payload": ...,
+#      "replayable": true, "prior_effects": [{"effect_type": "downstream.notify", ...}]}]}
+#    不可重放的版本会带 skip_reason：still_in_pipeline（仍在正常管线）、
+#    frozen_by_conflict（冲突冻结中）、superseded_version（人工未选中的版本）、
+#    active_replay_in_batch:N（另一批里已有该内容的活动重放任务）
+
+# 2) 提交一批重放任务（批次 + 全部任务单事务落盘；request_id 为提交幂等键，
+#    重复提交返回原批次，不会生成第二批任务）
+curl -X POST localhost:8000/admin/replays \
+  -H 'Content-Type: application/json' \
+  -d '{"external_id": "A-1001", "status": "done",
+       "operator": "ops-li", "reason": "下游丢数据需补发", "request_id": "req-20260912-01"}'
+# -> {"result": "created", "batch_id": 1, "total": 1, "skipped": []}
+
+# 3) 跟踪进度 / 控制执行
+curl localhost:8000/admin/replays/1            # 批次详情：进度计数 + 每条任务状态
+curl -X POST localhost:8000/admin/replays/1/pause  -H 'Content-Type: application/json' -d '{"operator": "ops-li"}'
+curl -X POST localhost:8000/admin/replays/1/resume -H 'Content-Type: application/json' -d '{"operator": "ops-li"}'
+curl -X POST localhost:8000/admin/replays/1/cancel -H 'Content-Type: application/json' -d '{"operator": "ops-li", "note": "改走线下"}'
+
+# 4) 失败任务单独重试（只影响这一条，不阻塞其他编号）
+curl -X POST localhost:8000/admin/replays/tasks/3/retry \
+  -H 'Content-Type: application/json' -d '{"operator": "ops-li"}'
+
+# 5) 该批次的完整审计记录（可按 task_id 过滤到单条）
+curl 'localhost:8000/admin/replays/1/events'
+curl 'localhost:8000/admin/replays/1/events?task_id=3'
+```
+
+- 只有 `done` / `quarantined` 的版本可重放；仍在管线中、冲突冻结中、人工未选中的
+  版本会被跳过并在预览/提交响应里给出原因。
+- 重放副作用与正常处理**走同一条 outbox 幂等链路**：幂等键以 `replay:{task_id}`
+  为作用域——同一任务重试、服务重启都不会重复派发，下游仍按幂等键去重；
+  新批次的重放才会有意再次产生外部效果。
+- 批次状态机：`running → paused → running → completed / completed_with_failures`，
+  `cancelled` 为终态；全部任务到终态后批次自动收尾。
+
+
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -151,3 +213,8 @@ curl 'localhost:8000/admin/events?external_id=A-1001'
   人工选定后，未选中版本滞留在 outbox 的副作用在同一事务里置为 `cancelled`
   （内容保留可查），派发器只放行「done 且未冻结」版本——旧版本不会再对外产生效果。
 - **隔离不蔓延**：隔离是 per-delivery 的状态，worker 拉取时天然跳过，其他编号照常处理。
+- **重放即审计**：重放的每个动作（创建/暂停/继续/取消/执行/失败/人工重试）都写
+  `events` 并带 `replay_batch_id`/`replay_task_id`，一批重放的完整轨迹一次查全；
+  重放任务只引用落盘原文（delivery_id），不复制内容，原始版本永不改写。
+- **老库就地升级**：首次以新版本打开旧库时自动给 `outbox` 补 `replay_task_id` 列，
+  无需手工迁移。
