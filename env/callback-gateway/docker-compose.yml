@@ -1,0 +1,19 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - gateway-data:/data                 # SQLite 持久化：重启不丢已落盘的回调
+      - ./keys.json:/config/keys.json:ro   # 签名密钥环（参考 keys.example.json）
+    environment:
+      RETRY_BASE_SECONDS: "5"              # 重试间隔基数（指数退避）
+      RETRY_CAP_SECONDS: "300"             # 重试间隔上限
+      MAX_ATTEMPTS: "5"                    # 连续失败上限，超过进隔离队列
+      WORKER_POLL_INTERVAL: "1"
+      SIGNATURE_TOLERANCE_SECONDS: "300"   # 签名时间戳容差（防重放）
+      RUN_WORKER: "true"
+    restart: unless-stopped
+
+volumes:
+  gateway-data:

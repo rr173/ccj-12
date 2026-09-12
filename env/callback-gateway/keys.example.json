@@ -1,0 +1,15 @@
+{
+  "keys": [
+    {
+      "kid": "k2",
+      "secret": "CHANGE-ME-current-secret",
+      "status": "active"
+    },
+    {
+      "kid": "k1",
+      "secret": "CHANGE-ME-previous-secret",
+      "status": "retired",
+      "grace_until": "2026-10-01T00:00:00Z"
+    }
+  ]
+}

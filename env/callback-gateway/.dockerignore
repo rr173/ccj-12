@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+*.db
+*.db-wal
+*.db-shm
+keys.json
+.git/
