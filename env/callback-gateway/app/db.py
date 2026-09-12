@@ -30,6 +30,10 @@
                     不能在多个节点持有效票；委托在节点满足前失效/撤销时其票置为无效
 - replay_delegations      审批委托：运营把某角色在生效/失效时间窗内委托给受托人，
                     可撤销、重新激活；到期由 worker 扫描失效，节点决定时必须仍有效
+- replay_policy_changes   策略变更单：影响预览（含策略版本与生成时间）+ 审批门禁；
+                    高风险变更须由不同于提交人的运营审批后才能执行，拒绝/超时/重复
+                    提交/并发审批都只是变更单状态转移，执行与配置变更同一事务，
+                    不会产生部分生效
 """
 from __future__ import annotations
 
@@ -306,6 +310,47 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_replay_votes_node_voter_valid
 CREATE UNIQUE INDEX IF NOT EXISTS idx_replay_votes_batch_voter_valid
     ON replay_node_votes(batch_id, voter) WHERE status='valid';
 CREATE INDEX IF NOT EXISTS idx_replay_votes_node ON replay_node_votes(node_id, status);
+
+-- 策略变更单：「提交新策略 / 发布候选版本」的影响预览与审批门禁。
+-- 提交即固化影响预览与基线（当前 applied 版本 + 各等级稳定指针）；pending/approved
+-- 期间不改变任何线上配置（旧稳定版本继续服务）。高风险变更（risk_class=high）必须由
+-- 不同于提交人的运营 approve 后才能 apply；apply 把「整份策略生效 / 候选灰度发布」与
+-- 变更单落定放在同一事务，并校验基线未被其他变更推进（stale 拒绝）——拒绝、超时
+-- （expires_at，worker 扫描 + 决定时惰性判定）、重复提交（request_id 幂等）、并发审批
+-- （写事务串行 + 条件状态转移）都只是变更单状态转移，不会产生部分生效。
+CREATE TABLE IF NOT EXISTS replay_policy_changes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id  TEXT UNIQUE,           -- 提交幂等键：重复提交返回原变更单，不生成第二张
+    change_type TEXT NOT NULL,         -- apply_policy | publish_release
+    status      TEXT NOT NULL,         -- pending|approved|applied|rejected|expired
+    operator    TEXT NOT NULL,         -- 提交人（高风险变更的审批人必须不同于此人）
+    note        TEXT,
+    policy      TEXT,                  -- apply_policy：规范化策略 JSON（批准后按此整份生效）
+    candidate_version INTEGER,         -- publish_release：候选策略版本
+    risk_level  TEXT,                  -- publish_release：灰度风险等级
+    min_size    INTEGER,               -- publish_release：批次规模闸门
+    max_size    INTEGER,
+    rollout_percent INTEGER,           -- publish_release：分流百分比
+    base_version INTEGER,              -- 预览基线：当前 applied 策略版本（NULL=内置默认）
+    base_stable_versions TEXT NOT NULL,-- 预览基线：各风险等级稳定指针 JSON
+    risk_class  TEXT NOT NULL,         -- high|standard：high 必须经他人审批后才能执行
+    requires_approval INTEGER NOT NULL,
+    preview     TEXT NOT NULL,         -- 影响预览 JSON（含策略版本与生成时间，随单固化）
+    decision    TEXT,                  -- approved|rejected（审批决定）
+    decided_by  TEXT,
+    decided_at  REAL,
+    decision_reason TEXT,              -- 拒绝原因（拒绝必填）
+    decision_note TEXT,
+    applied_version INTEGER,           -- apply_policy 生效后的策略版本（变更后版本）
+    release_id  INTEGER,               -- publish_release 创建的灰度发布单
+    applied_by  TEXT,
+    applied_at  REAL,
+    expires_at  REAL NOT NULL,         -- 审批超时：到期未决/未执行的变更不能再生效
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_replay_policy_changes_status
+    ON replay_policy_changes(status, expires_at);
 """
 
 

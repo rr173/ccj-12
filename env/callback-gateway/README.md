@@ -22,6 +22,7 @@
                 │   筛选预览 → 批量提交 → 多级审批 → 暂停/继续/取消     │
                 │   审批策略版本化维护 /admin/replay-policies/*        │
                 │     候选灰度发布·暂停/恢复/转正/回滚 …/releases/*     │
+                │     影响预览·审批门禁 …/preview …/changes/*           │
                 │   审批委托（生效/失效/撤销/再激活）                    │
                 │     /admin/replay-delegations/*                      │
                 │   重放副作用走同一 outbox 幂等链路                   │
@@ -61,6 +62,10 @@
 | 批次记录命中的策略版本/分流规则/发布批次 | `replay_batches.policy_lane`（stable/candidate）+ `rollout_id` + `rollout_seq`；`policy_snapshot.routing` 存闸门/百分比/bucket/分流键，提交响应与批次详情直接可见 |
 | 详情与策略历史展示稳定版本/候选版本/分流命中/暂停回滚原因 | `GET .../replay-policies/current` 附 `rollout`（每等级稳定/上一稳定版本 + 开放中的候选发布）；`GET .../releases` / `.../releases/{id}` 含状态、暂停/回滚原因与命中统计；批次详情 `approval.policy_routing` |
 | 灰度发布与命中全程审计、并发无跨版本快照 | `replay_policy_release_published/paused/resumed/promoted/rolled_back/superseded` + 每批次 `replay_policy_batch_routed`；版本解析在批次写事务（BEGIN IMMEDIATE）内与发布变更串行，快照与列必来自同一份发布状态 |
+| 策略变更前可预览影响范围 | `POST /admin/replay-policies/preview`（只读）：按当前批次规模与风险等级计算受影响范围（规模区间 × 等级）、预计命中比例（以历史批次为样本；发布候选时按闸门 × 百分比估算）、审批节点链前后对比与不兼容规则（高风险 fail-closed 缺口/被遮蔽规则/闸门无覆盖）；结果带策略版本与生成时间，不改变线上配置，见 `app/replay_policy_gate.py` |
+| 高风险策略变更须他人审批后才能发布 | `replay_policy_changes` 变更单：提交即固化预览与基线；触及 high 等级/削弱审批强度/引入高风险缺口的变更（risk_class=high）必须由不同于提交人的运营 `approve` 后才能 `apply`；pending/approved 期间旧稳定版本继续服务 |
+| 变更拒绝/超时/重复提交/并发审批不产生部分生效 | 拒绝与超时（`REPLAY_POLICY_CHANGE_TTL_SECONDS`，worker 扫描 + 决定时惰性判定）只是变更单状态转移；`request_id` 幂等键防重复提交；并发审批由写事务串行 + 条件状态转移保证单一赢家；`apply` 把配置变更与变更单落定放在同一事务，基线被推进过时拒绝（stale） |
+| 发布后可查变更前后版本/预览/审批决定/审计 | `GET .../changes` / `.../changes/{id}`：base_version 与 applied_version（或 release_id）、固化的影响预览、审批决定（决定人/时间/原因）与 `replay_policy_change_*` 审计轨迹 |
 | 详情展示每节点已批准人数/法定人数/有效委托/缺额 | 批次详情 `approval.nodes`：`approved_count`、`required_approvals`、`missing`、`quorum_reached`、`valid_delegations`（允许角色当前有效的委托）、每张票（含已失效票）；另有批次级 `missing_approvals` |
 | 委托与决定全生命周期可审计 | `replay_delegation_created`/`revoked`/`reactivated`/`expired`、`replay_node_vote_invalidated`、`replay_approval_node_quorum_lost` + 既有节点/批次事件；节点可带原因跳过（视为满足，留痕） |
 | 审批结果/拒绝原因/超时释放/批准后执行全部可审计 | `replay_batch_approved` / `replay_batch_rejected`（含 reason）/ `replay_batch_approval_expired` + 既有执行事件；批次详情含 `approval`（状态、发起人、审批人、批准时间、拒绝原因、截止时间） |
@@ -456,6 +461,67 @@ curl -X POST localhost:8000/admin/replay-policies/releases/1/rollback \
   （`replay_batch_approved`/`rejected`/`approval_expired`）、策略变更
   （`replay_policy_applied`/`rejected`）全部落 `events`，可按批次一次查全。
 
+### 策略变更的影响预览与审批门禁
+
+在整份提交与灰度发布之上，运营可以为「提交新策略」或「发布候选版本」先做
+**影响预览**，再走**审批门禁**发布（`app/replay_policy_gate.py`）：
+
+```bash
+# 1) 影响预览（只读，不改变线上配置）：新策略文档与候选版本二选一
+curl -X POST localhost:8000/admin/replay-policies/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"policy": {"rules": [...]}}'
+# 预演灰度发布：候选版本 + 风险等级 + 规模闸门 + 分流百分比
+curl -X POST localhost:8000/admin/replay-policies/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"candidate_version": 3, "risk_level": "high",
+       "rollout_percent": 30, "min_size": 1, "max_size": 20}'
+# -> {"generated_at": ..., "policy_version": 4, "version_status": "expected",
+#     "base_version": 3, "risk_class": "high", "requires_approval": true,
+#     "affected_scope": [{"risk_level": "high", "min_size": 1, "max_size": null,
+#        "before_rule": "...", "after_rule": "...", "approval_nodes": {"before": [...], "after": [...]},
+#        "weakens_approval": false}],
+#     "estimated_hit": {"basis": "replay_batches_history", "sampled_batches": 42,
+#        "affected_batches": 9, "estimated_hit_ratio": 0.214, ...},
+#     "incompatible_rules": [{"type": "high_risk_uncovered", ...}]}
+
+# 2) 提交变更单：预览与基线（当前 applied 版本 + 各等级稳定指针）随单固化，
+#    状态 pending——不影响线上，旧稳定版本继续服务；request_id 为幂等键
+curl -X POST localhost:8000/admin/replay-policies/changes \
+  -H 'Content-Type: application/json' \
+  -d '{"operator": "ops-li", "request_id": "chg-2026-001",
+       "policy": {"rules": [...]}}'
+# -> 201 {"result": "created", "change": {"id": 1, "status": "pending",
+#         "risk_class": "high", "requires_approval": true, "preview": {...}}}
+
+# 3) 高风险变更：由不同于提交人的运营批准（拒绝必填原因）；标准变更无需审批，
+#    提交人可直接执行。超时（REPLAY_POLICY_CHANGE_TTL_SECONDS）未决自动 expired
+curl -X POST localhost:8000/admin/replay-policies/changes/1/approve \
+  -H 'Content-Type: application/json' -d '{"operator": "ops-wang"}'
+
+# 4) 执行：配置变更（整份生效 / 创建灰度发布单）与变更单落定同一事务；
+#    基线被其他变更推进过时拒绝（stale），需重新预览生成新变更单
+curl -X POST localhost:8000/admin/replay-policies/changes/1/apply \
+  -H 'Content-Type: application/json' -d '{"operator": "ops-li"}'
+# -> {"result": "applied", "change": {"result": {"applied_version": 4, ...}}}
+
+# 5) 发布后查询：变更前后版本、固化的影响预览、审批决定与审计轨迹
+curl localhost:8000/admin/replay-policies/changes/1
+```
+
+- **预览内容**：受影响范围按新旧规则的规模边界切成区间逐段对比（命中规则、
+  审批节点链前后对比、是否削弱审批强度）；预计命中比例以 `replay_batches` 历史
+  批次的「风险等级 × 规模」分布为样本（发布候选时按闸门内批次占比 × 分流百分比
+  估算进入候选车道的比例）；不兼容规则含高风险 fail-closed 缺口、被前序规则
+  完全遮蔽的无效规则、候选策略不覆盖灰度闸门。
+- **高风险判定**：受影响范围触及 high 等级、任一区间削弱审批强度（节点变少/
+  法定人数变少/时限变长/从需审批变为无需审批）、或引入高风险无规则缺口——
+  任一成立即 `risk_class=high`，必须经他人审批；否则为标准变更，提交人可直接执行。
+- **不产生部分生效**：拒绝、超时、重复提交（`request_id` 幂等）、并发审批
+  （写事务串行 + 条件状态转移，单一赢家）都只是变更单状态转移；`apply` 把
+  「整份策略生效 / 候选灰度发布」与变更单落定放在同一事务，任一校验失败整体
+  回滚。已提交的重放批次持有自己的策略快照，全程不受变更影响。
+
 ## 审批委托
 
 运营可以把某个审批角色在**生效/失效时间窗**内委托给受托人（`app/delegation.py`）。
@@ -509,6 +575,7 @@ curl -X POST localhost:8000/admin/replay-delegations/12/reactivate \
 | `WORKER_POLL_INTERVAL` | `1` | worker 轮询间隔（秒） |
 | `SIGNATURE_TOLERANCE_SECONDS` | `300` | 签名时间戳容差（防重放） |
 | `REPLAY_APPROVAL_TIMEOUT_SECONDS` | `3600` | 内置默认策略中高风险批次的审批超时（自定义策略后由各节点的 `timeout_seconds` 取代）；超时未决由 worker 自动释放（取消）批次 |
+| `REPLAY_POLICY_CHANGE_TTL_SECONDS` | `3600` | 策略变更单的审批超时：到期未决/未执行的变更由 worker 置为 `expired`，不能再生效 |
 | `RUN_WORKER` | `true` | 是否在本进程跑后台 worker |
 
 ## 设计要点

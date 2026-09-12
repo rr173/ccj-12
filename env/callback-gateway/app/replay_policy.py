@@ -163,6 +163,31 @@ def match_rule(rules: list[dict], risk_level: str, total: int) -> dict | None:
     return None
 
 
+def apply_policy_tx(cur: sqlite3.Cursor, operator: str, rules: list[dict],
+                    now: float) -> int:
+    """在已有写事务内整份应用策略：分配版本号、写 applied 记录、整份切换各风险等级
+    稳定指针（并关闭未结束的灰度发布）并落审计事件，返回新版本号。
+
+    供「直接提交策略」（ReplayPolicyStore.record_applied）与「变更门禁批准后执行」
+    （replay_policy_gate.apply_change）共用：与调用方事务同生共死，不会部分生效。"""
+    from . import replay_rollout
+    row = cur.execute("SELECT MAX(version) AS v FROM replay_policy_versions").fetchone()
+    version = (row["v"] or 0) + 1
+    cur.execute(
+        """INSERT INTO replay_policy_versions
+           (version, result, policy, operator, reason, created_at)
+           VALUES (?,?,?,?,NULL,?)""",
+        (version, "applied",
+         json.dumps({"rules": rules}, ensure_ascii=False, sort_keys=True),
+         operator, now),
+    )
+    audit.record(cur, "replay_policy_applied", None, None,
+                 {"version": version, "operator": operator,
+                  "rules": len(rules)}, ts=now)
+    replay_rollout.apply_full_policy(cur, version, rules, operator, now)
+    return version
+
+
 class ReplayPolicyStore:
     """replay_policy_versions 表的读写；版本号在写事务内分配，并发提交不会重号。"""
 
@@ -176,22 +201,8 @@ class ReplayPolicyStore:
         灰度分流见 replay_rollout.py：稳定指针与发布单的更新和策略版本写入同事务，
         并发的批次提交只会看到完整的旧状态或完整的新状态，不会读到半成品。"""
         now = time.time()
-        from . import replay_rollout
         with self._db.tx() as cur:
-            row = cur.execute("SELECT MAX(version) AS v FROM replay_policy_versions").fetchone()
-            version = (row["v"] or 0) + 1
-            cur.execute(
-                """INSERT INTO replay_policy_versions
-                   (version, result, policy, operator, reason, created_at)
-                   VALUES (?,?,?,?,NULL,?)""",
-                (version, "applied",
-                 json.dumps({"rules": rules}, ensure_ascii=False, sort_keys=True),
-                 operator, now),
-            )
-            audit.record(cur, "replay_policy_applied", None, None,
-                         {"version": version, "operator": operator,
-                          "rules": len(rules)}, ts=now)
-            replay_rollout.apply_full_policy(cur, version, rules, operator, now)
+            version = apply_policy_tx(cur, operator, rules, now)
             return version, now
 
     def record_rejected(self, operator: str, raw_policy: str, reasons: list[str]) -> None:

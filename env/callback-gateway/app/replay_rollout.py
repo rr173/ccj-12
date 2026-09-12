@@ -260,74 +260,88 @@ def publish_release(db: Database, req: ReleasePublishRequest,
     不改变稳定版本；同等级已有未结束发布（candidate/paused）时拒绝（409）。
     """
     operator = _require(req.operator, "operator")
-    _validate_gates(req.risk_level, req.candidate_version, req.rollout_percent,
-                    req.min_size, req.max_size)
-    note = (req.note or "").strip()
     with db.tx() as cur:
-        candidate = _load_applied_version(cur, req.candidate_version)
-        candidate_rules = json.loads(candidate["policy"])["rules"]
-        stable = _stable_row(cur, req.risk_level)
-        stable_version = stable["policy_version"] if stable is not None else None
-        if req.candidate_version == stable_version:
-            raise HTTPException(
-                422, "candidate_version is already the stable version for "
-                     f"risk_level={req.risk_level}")
-        if _open_release(cur, req.risk_level) is not None:
-            raise HTTPException(
-                409, f"an unfinished release already exists for risk_level="
-                     f"{req.risk_level}; pause/rollback/promote it first")
-        # 闸门覆盖校验：候选策略必须有规则覆盖该风险等级且规模区间与闸门相交——
-        # 否则被闸门引入候选车道的批次将无规则匹配（高风险 fail closed 直接拒绝提交）。
-        covering = [r for r in candidate_rules
-                    if r["risk_level"] in ("any", req.risk_level)
-                    and _size_overlap(r["min_size"], r["max_size"],
-                                      req.min_size, req.max_size)]
-        if not covering:
-            return JSONResponse(status_code=422, content={
-                "error": "candidate_policy_does_not_cover_gate",
-                "detail": ("candidate policy has no rule matching risk_level="
-                           f"{req.risk_level} within the declared size gate "
-                           f"[{req.min_size}, {req.max_size}]"),
-                "risk_level": req.risk_level,
-                "candidate_version": req.candidate_version,
-                "min_size": req.min_size, "max_size": req.max_size})
-        candidate_rule_name = covering[0]["name"]
-        row = cur.execute(
-            "SELECT COALESCE(MAX(rollout_seq),0) AS s FROM replay_policy_releases "
-            "WHERE risk_level=?", (req.risk_level,)).fetchone()
-        seq = row["s"] + 1
-        try:
-            cur.execute(
-                """INSERT INTO replay_policy_releases
-                   (risk_level, rollout_seq, candidate_version, candidate_rule_name,
-                    stable_version_at_publish, min_size, max_size, rollout_percent,
-                    status, operator, note, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,'candidate',?,?,?,?)""",
-                (req.risk_level, seq, req.candidate_version, candidate_rule_name,
-                 stable_version, req.min_size, req.max_size, req.rollout_percent,
-                 operator, note or None, now, now))
-        except sqlite3.IntegrityError:
-            # 并发发布撞同等级「至多一条未结束」部分唯一索引
-            raise HTTPException(409, "an unfinished release already exists for "
-                                    f"risk_level={req.risk_level}")
-        release_id = cur.lastrowid
-        audit.record(cur, "replay_policy_release_published", None, None, {
-            "release_id": release_id, "risk_level": req.risk_level,
-            "rollout_seq": seq, "candidate_version": req.candidate_version,
+        return publish_release_tx(
+            cur, operator=operator, risk_level=req.risk_level,
+            candidate_version=req.candidate_version,
+            rollout_percent=req.rollout_percent, min_size=req.min_size,
+            max_size=req.max_size, note=(req.note or "").strip(), now=now)
+
+
+def publish_release_tx(cur: sqlite3.Cursor, *, operator: str, risk_level: str,
+                       candidate_version: int, rollout_percent: int,
+                       min_size: int | None, max_size: int | None,
+                       note: str, now: float) -> dict | JSONResponse:
+    """在已有写事务内发布候选灰度（供发布端点与变更门禁的执行步骤共用）。
+
+    闸门覆盖不满足时返回 422 JSONResponse——此刻事务内尚无写入，调用方直接返回
+    或转为异常回滚都不会留下部分生效。
+    """
+    _validate_gates(risk_level, candidate_version, rollout_percent,
+                    min_size, max_size)
+    candidate = _load_applied_version(cur, candidate_version)
+    candidate_rules = json.loads(candidate["policy"])["rules"]
+    stable = _stable_row(cur, risk_level)
+    stable_version = stable["policy_version"] if stable is not None else None
+    if candidate_version == stable_version:
+        raise HTTPException(
+            422, "candidate_version is already the stable version for "
+                 f"risk_level={risk_level}")
+    if _open_release(cur, risk_level) is not None:
+        raise HTTPException(
+            409, f"an unfinished release already exists for risk_level="
+                 f"{risk_level}; pause/rollback/promote it first")
+    # 闸门覆盖校验：候选策略必须有规则覆盖该风险等级且规模区间与闸门相交——
+    # 否则被闸门引入候选车道的批次将无规则匹配（高风险 fail closed 直接拒绝提交）。
+    covering = [r for r in candidate_rules
+                if r["risk_level"] in ("any", risk_level)
+                and _size_overlap(r["min_size"], r["max_size"],
+                                  min_size, max_size)]
+    if not covering:
+        return JSONResponse(status_code=422, content={
+            "error": "candidate_policy_does_not_cover_gate",
+            "detail": ("candidate policy has no rule matching risk_level="
+                       f"{risk_level} within the declared size gate "
+                       f"[{min_size}, {max_size}]"),
+            "risk_level": risk_level,
+            "candidate_version": candidate_version,
+            "min_size": min_size, "max_size": max_size})
+    candidate_rule_name = covering[0]["name"]
+    row = cur.execute(
+        "SELECT COALESCE(MAX(rollout_seq),0) AS s FROM replay_policy_releases "
+        "WHERE risk_level=?", (risk_level,)).fetchone()
+    seq = row["s"] + 1
+    try:
+        cur.execute(
+            """INSERT INTO replay_policy_releases
+               (risk_level, rollout_seq, candidate_version, candidate_rule_name,
+                stable_version_at_publish, min_size, max_size, rollout_percent,
+                status, operator, note, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,'candidate',?,?,?,?)""",
+            (risk_level, seq, candidate_version, candidate_rule_name,
+             stable_version, min_size, max_size, rollout_percent,
+             operator, note or None, now, now))
+    except sqlite3.IntegrityError:
+        # 并发发布撞同等级「至多一条未结束」部分唯一索引
+        raise HTTPException(409, "an unfinished release already exists for "
+                                f"risk_level={risk_level}")
+    release_id = cur.lastrowid
+    audit.record(cur, "replay_policy_release_published", None, None, {
+        "release_id": release_id, "risk_level": risk_level,
+        "rollout_seq": seq, "candidate_version": candidate_version,
+        "candidate_rule_name": candidate_rule_name,
+        "stable_version": stable_version,
+        "min_size": min_size, "max_size": max_size,
+        "rollout_percent": rollout_percent,
+        "operator": operator, "note": note or None}, ts=now)
+    return {"result": "published", "release_id": release_id,
+            "risk_level": risk_level, "rollout_seq": seq,
+            "candidate_version": candidate_version,
             "candidate_rule_name": candidate_rule_name,
             "stable_version": stable_version,
-            "min_size": req.min_size, "max_size": req.max_size,
-            "rollout_percent": req.rollout_percent,
-            "operator": operator, "note": note or None}, ts=now)
-        body = {"result": "published", "release_id": release_id,
-                "risk_level": req.risk_level, "rollout_seq": seq,
-                "candidate_version": req.candidate_version,
-                "candidate_rule_name": candidate_rule_name,
-                "stable_version": stable_version,
-                "min_size": req.min_size, "max_size": req.max_size,
-                "rollout_percent": req.rollout_percent,
-                "status": RELEASE_CANDIDATE, "published_at": now}
-        return body
+            "min_size": min_size, "max_size": max_size,
+            "rollout_percent": rollout_percent,
+            "status": RELEASE_CANDIDATE, "published_at": now}
 
 
 def _load_release_or_404(cur: sqlite3.Cursor, release_id: int) -> sqlite3.Row:

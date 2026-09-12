@@ -22,6 +22,8 @@ class Settings:
     signature_tolerance_seconds: int = 300
     # 高风险重放批次的审批超时（秒）：提交后超时仍未由他人批准，自动释放（取消）批次
     replay_approval_timeout_seconds: float = 3600.0
+    # 策略变更单的审批超时（秒）：到期未决/未执行的变更置为 expired，不能再生效
+    replay_policy_change_ttl_seconds: float = 3600.0
     # 是否随服务启动后台 worker（测试时可关闭，手动驱动）
     run_worker: bool = True
 
@@ -39,5 +41,7 @@ class Settings:
             ),
             replay_approval_timeout_seconds=float(os.environ.get(
                 "REPLAY_APPROVAL_TIMEOUT_SECONDS", cls.replay_approval_timeout_seconds)),
+            replay_policy_change_ttl_seconds=float(os.environ.get(
+                "REPLAY_POLICY_CHANGE_TTL_SECONDS", cls.replay_policy_change_ttl_seconds)),
             run_worker=os.environ.get("RUN_WORKER", "true").lower() == "true",
         )

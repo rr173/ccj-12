@@ -62,6 +62,7 @@ from .db import Database
 from . import delegation as delegation_mod
 from .handlers import business_handler
 from .replay_policy import ROLE_ANY, match_rule
+from .replay_policy_gate import expire_changes
 from .replay_rollout import batch_routing_key, record_batch_route_audit, \
     resolve_route, route_snapshot
 
@@ -1382,6 +1383,9 @@ class ReplayWorker:
         # 再处理审批超时：到期仍未满足节点法定人数的批次整体取消（释放占住的任务），
         # 必须先于领取，保证超时批次的任务本轮绝不会被领取
         expire_approvals(self.db, now)
+        # 策略变更单审批超时：到期未决/未执行的变更置为 expired（只改变更单状态，
+        # 不触碰任何线上配置；与人工决定互斥，重复扫描不会产生第二次效果）
+        expire_changes(self.db, now)
         # 待审批批次的 pending 任务也取出交给领取闸门：闸门会以 awaiting_approval
         # 挡下（原因变化才写审计，轮询不刷表）；running 且审批通过/无需审批的才领取
         rows = self.db.query(
