@@ -4,8 +4,9 @@
 - 接入（本文件 POST /callbacks）：验签 -> 落盘 -> 确认，不做任何业务处理；
 - 处理（worker.py 后台任务）：重试、隔离、副作用派发；
 - 人工处置（admin.py）：冲突比较/选定、隔离重投、审计查询；
-- 业务重放（replay.py）：筛选预览 -> 批量提交 -> 高风险审批（他人批准/拒绝/超时释放）
-  -> 暂停/继续/取消 -> 审计查询。
+- 业务重放（replay.py）：筛选预览 -> 批量提交 -> 多级审批（replay_policy.py 策略
+  按风险等级与批次规模生成串行/并行审批节点，全部批准才放行）-> 暂停/继续/取消
+  -> 审计查询。
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from .db import Database
 from .ingest import ingest
 from .keyconfig import KeyConfigStore, KeyRotationService
 from .replay import ReplayWorker, create_replay_router
+from .replay_policy import create_policy_router
 from .security import KeyRingManager
 from .worker import Worker
 
@@ -90,6 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(create_admin_router(db, keys))
     app.include_router(create_replay_router(db, settings))
+    app.include_router(create_policy_router(db, settings.replay_approval_timeout_seconds))
     return app
 
 

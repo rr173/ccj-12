@@ -8,6 +8,14 @@
   提交带 request_id 时重复提交返回原批次；跨批存在活动任务（pending/processing，
   含待审批批次占住的任务）的投递会被跳过（已完成的批次不阻塞以后再次重放
   ——那是有意为之的新批次）；
+- 多级审批策略：审批要求不再硬编码为「高风险一次他人批准」，而是由可版本化
+  维护的审批策略（见 replay_policy.py）按风险等级与批次规模匹配规则，为每个
+  提交的批次生成一串审批节点（串行逐节点激活 / 并行同时待决）。每个节点记录
+  指定角色、实际审批人与截止时间；审批人不能是批次发起人，也不能重复承担
+  同一批次的多个节点；任一节点拒绝或超时即终止整个批次（未执行任务整体
+  取消），所有节点批准（或被有理由地跳过）后批次才进入 running，worker
+  方可领取。批次落盘时保存所采用策略的快照（版本 + 规则 + 节点规格），
+  之后的策略更新只影响新提交的批次；
 - 高风险审批：提交时可用 risk_level=high（并填 approval_note）标记高风险批次，
   批次进入 pending_approval 而不是 running，worker 在批准前不能领取其任何任务
   （跨批活动检查同时占住对应内容，防止绕过审批另开一批）；批准必须由不同于
@@ -52,6 +60,7 @@ from . import audit
 from .config import Settings
 from .db import Database
 from .handlers import business_handler
+from .replay_policy import ROLE_ANY, match_rule, resolve_rules
 
 log = logging.getLogger("gateway.replay")
 
@@ -110,6 +119,27 @@ class RejectionRequest(BaseModel):
     note: str = ""
 
 
+class NodeDecisionRequest(BaseModel):
+    """单个审批节点的批准请求：role 为审批人实际承担的角色（节点指定非 any 角色时必填且须一致）。"""
+    operator: str                  # 审批人（必填，须不同于发起人，且未决定过本批其他节点）
+    role: str | None = None        # 审批人承担的角色；节点指定角色非 any 时必填且必须匹配
+    note: str = ""
+
+
+class NodeRejectionRequest(BaseModel):
+    operator: str
+    reason: str                    # 拒绝原因（必填）；任一节点拒绝即终止整个批次
+    role: str | None = None
+    note: str = ""
+
+
+class NodeSkipRequest(BaseModel):
+    operator: str
+    reason: str                    # 跳过原因（必填，留痕可追溯）；跳过视为该节点已满足
+    role: str | None = None
+    note: str = ""
+
+
 # 批次/审批状态
 BATCH_RUNNING = "running"
 BATCH_PAUSED = "paused"
@@ -122,6 +152,16 @@ APPROVAL_PENDING = "pending"
 APPROVAL_APPROVED = "approved"
 APPROVAL_REJECTED = "rejected"
 APPROVAL_EXPIRED = "expired"
+
+# 审批节点状态
+NODE_WAITING = "waiting"      # 串行链中尚未轮到
+NODE_ACTIVE = "active"        # 待决中（可批准/拒绝/跳过，超时会被释放）
+NODE_APPROVED = "approved"
+NODE_REJECTED = "rejected"
+NODE_SKIPPED = "skipped"      # 有理由跳过，视为已满足
+NODE_EXPIRED = "expired"      # 超时未决（批次随之取消）
+NODE_CANCELLED = "cancelled"  # 批次被终止/撤回时随之关闭的待决节点
+NODE_UNDECIDED = (NODE_WAITING, NODE_ACTIVE)
 
 
 def _require_operator(operator: str, field: str = "operator"):
@@ -233,10 +273,12 @@ def preview(db: Database, req: PreviewRequest) -> dict:
 # ---- 提交批次 --------------------------------------------------------------
 
 def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[int, dict]:
-    """一次性提交一批重放任务：批次 + 全部任务在一个事务里落盘。
+    """一次性提交一批重放任务：批次 + 全部任务 + 审批节点链在一个事务里落盘。
 
-    高风险批次（risk_level=high）落为 pending_approval：任务照常落盘并占住对应
-    内容（其他批次不能再提交同一投递），但 worker 在非发起人明确批准前不领取。
+    审批节点链由当前生效策略按风险等级与批次规模解析生成（无已生效策略时
+    用内置默认策略）；解析结果作为策略快照随批次保存，之后的策略更新不影响
+    本批。需要审批的批次落为 pending_approval：任务照常落盘并占住对应内容
+    （其他批次不能再提交同一投递），但 worker 在所有节点满足前不领取。
     """
     operator = _require_operator(req.operator)
     if not req.reason.strip():
@@ -277,14 +319,39 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
                      "matched": len(rows), "skipped": skipped}
 
     now = time.time()
-    if high_risk:
+    total = len(eligible)
+    # 按当前生效策略（无已生效版本时为内置默认策略）解析本批的审批节点链：
+    # 规则按风险等级与批次规模匹配，节点串行或并行；解析结果作为快照随批次
+    # 落盘，之后策略更新不影响本批。已生效策略下高风险批次无规则匹配时
+    # 拒绝提交（fail closed，不静默降低审批要求）。
+    policy_version, rules = resolve_rules(db, approval_timeout)
+    rule = match_rule(rules, req.risk_level, total)
+    if rule is None:
+        if high_risk:
+            return 422, {"error": "no_applicable_policy",
+                         "detail": "no approval policy rule matches this batch; "
+                                   "ask a policy maintainer to cover it",
+                         "risk_level": req.risk_level, "total": total}
+        node_specs, mode, rule_name = [], "serial", None
+    else:
+        node_specs, mode, rule_name = rule["nodes"], rule["mode"], rule["name"]
+
+    if node_specs:
         batch_status = BATCH_PENDING_APPROVAL
         approval_status = APPROVAL_PENDING
-        deadline = now + approval_timeout
+        # 批次截止时间 = 活动节点中最早的截止（串行：首节点；并行：全体同时激活取最小）
+        first_timeouts = ([node_specs[0]["timeout_seconds"]] if mode == "serial"
+                          else [n["timeout_seconds"] for n in node_specs])
+        deadline = now + min(first_timeouts)
     else:
         batch_status = BATCH_RUNNING
         approval_status = APPROVAL_NOT_REQUIRED
         deadline = None
+    snapshot = {"policy_version": policy_version, "rule_name": rule_name, "mode": mode,
+                "risk_level": req.risk_level, "batch_size": total,
+                "nodes": [{"seq": i, "role": n["role"],
+                           "timeout_seconds": n["timeout_seconds"]}
+                          for i, n in enumerate(node_specs)]}
     filters = req.model_dump(exclude={"operator", "reason", "request_id", "max_concurrency",
                                       "risk_level", "approval_note"})
     filters_json = json.dumps(filters, ensure_ascii=False, default=str)
@@ -294,11 +361,13 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
                 """INSERT INTO replay_batches
                    (request_id, operator, reason, status, filters, max_concurrency,
                     risk_level, approval_note, approval_status, approval_deadline,
+                    policy_version, policy_snapshot,
                     total, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (req.request_id, operator, req.reason, batch_status, filters_json,
                  req.max_concurrency, req.risk_level,
                  approval_note or None, approval_status, deadline,
+                 policy_version, json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
                  len(eligible), now, now),
             )
             batch_id = cur.lastrowid
@@ -314,6 +383,22 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
                     (batch_id, d["id"], d["external_id"], operator, req.reason,
                      d["created_at"], now, now),
                 )
+            # 审批节点链随批次一次性落盘（来自策略快照，之后不随策略变更而改变）：
+            # 串行只激活首节点，并行全部激活；激活时起算各自截止时间
+            for i, spec in enumerate(node_specs):
+                activated = mode == "parallel" or i == 0
+                cur.execute(
+                    """INSERT INTO replay_approval_nodes
+                       (batch_id, seq, role, status, timeout_seconds,
+                        activated_at, deadline, created_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (batch_id, i, spec["role"],
+                     NODE_ACTIVE if activated else NODE_WAITING,
+                     spec["timeout_seconds"],
+                     now if activated else None,
+                     now + spec["timeout_seconds"] if activated else None,
+                     now),
+                )
             audit.record(cur, "replay_batch_created", None, None, {
                 "replay_batch_id": batch_id, "operator": operator,
                 "reason": req.reason, "request_id": req.request_id,
@@ -321,6 +406,9 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
                 "risk_level": req.risk_level, "approval_note": approval_note or None,
                 "status": batch_status, "approval_status": approval_status,
                 "approval_deadline": deadline,
+                "policy_version": policy_version, "rule_name": rule_name,
+                "approval_mode": mode if node_specs else None,
+                "approval_nodes": len(node_specs),
                 "filters": filters, "total": len(eligible), "skipped": skipped}, ts=now)
     except sqlite3.IntegrityError:
         # 并发下 request_id 撞唯一键：返回已存在的那一批
@@ -337,7 +425,9 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
     body = {"result": "created", "batch_id": batch_id,
             "total": len(eligible), "skipped": skipped,
             "status": batch_status, "risk_level": req.risk_level,
-            "approval_status": approval_status}
+            "approval_status": approval_status,
+            "policy_version": policy_version,
+            "approval_nodes": len(node_specs)}
     if deadline is not None:
         body["approval_deadline"] = deadline
     return 201, body
@@ -352,102 +442,241 @@ def _get_batch_or_404(db: Database, batch_id: int):
     return row
 
 
-# ---- 高风险审批：批准 / 拒绝 / 超时释放 ---------------------------------------
+# ---- 多级审批：节点决定（批准/拒绝/跳过）、批次级兼容入口、超时释放 ---------------
 
-def _approval_guard(batch, operator: str) -> None:
-    """审批操作的共同前置：批次仍待决，且审批人不是发起人本人（职责分离）。"""
+def _batch_pending_guard(batch) -> None:
+    """审批决定的共同前置：批次仍处于待决状态（否则决定不再被接受）。"""
     if batch["approval_status"] != APPROVAL_PENDING \
             or batch["status"] != BATCH_PENDING_APPROVAL:
         raise HTTPException(
             409, f"batch approval is {batch['approval_status']}, "
                  f"batch is {batch['status']}, decision no longer accepted")
-    if operator == batch["operator"]:
-        raise HTTPException(403, "approver must be different from the batch operator")
 
 
-def approve(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
-    """批准高风险批次：审批人须不同于发起人；批准后批次进入 running，worker 方可领取。
+def _terminate_batch_rejected(cur: sqlite3.Cursor, batch, operator: str,
+                              reason: str, note: str, now: float) -> dict:
+    """任一节点拒绝 -> 整个批次终止：未执行任务整体取消，其余待决节点关闭。
 
-    条件更新（仅在仍为 pending_approval 时生效）保证重复/并发批准最多放行一次，
-    不会产生第二次执行。
+    拒绝不可撤销；占住的投递随之释放（之后可以重新提交新批次）。
     """
-    operator = _require_operator(operator, "operator")
-    now = time.time()
-    with db.tx() as cur:
-        batch = _get_batch_or_404(db, batch_id)
-        _approval_guard(batch, operator)
-        changed = cur.execute(
+    batch_id = batch["id"]
+    cancelled_tasks = cur.execute(
+        """UPDATE replay_tasks SET status='cancelled', blocked_reason=NULL,
+           finished_at=?, updated_at=?
+           WHERE batch_id=? AND status IN ('pending','processing')""",
+        (now, now, batch_id),
+    ).rowcount
+    cur.execute(
+        """UPDATE replay_approval_nodes SET status='cancelled'
+           WHERE batch_id=? AND status IN ('waiting','active')""",
+        (batch_id,),
+    )
+    cur.execute(
+        """UPDATE replay_batches
+           SET status='rejected', approval_status='rejected', approver=?,
+               approval_reason=?, approved_at=NULL, cancelled=cancelled+?,
+               updated_at=?, finished_at=?
+           WHERE id=? AND status='pending_approval' AND approval_status='pending'""",
+        (operator, reason, cancelled_tasks, now, now, batch_id),
+    )
+    audit.record(cur, "replay_batch_rejected", None, None,
+                 {"replay_batch_id": batch_id, "operator": operator,
+                  "submitted_by": batch["operator"], "reason": reason,
+                  "note": note, "risk_level": batch["risk_level"],
+                  "cancelled_tasks": cancelled_tasks}, ts=now)
+    return {"batch_status": BATCH_REJECTED, "approval_status": APPROVAL_REJECTED,
+            "cancelled_tasks": cancelled_tasks, "remaining_node_ids": []}
+
+
+def _advance_chain(cur: sqlite3.Cursor, batch, operator: str, note: str,
+                   now: float) -> dict:
+    """批准/跳过后推进审批链：串行激活下一节点（起算其截止时间）；
+    全部节点满足后批次才进入 running（条件更新保证并发决定最多放行一次）。"""
+    batch_id = batch["id"]
+    remaining = cur.execute(
+        """SELECT * FROM replay_approval_nodes
+           WHERE batch_id=? AND status IN ('waiting','active') ORDER BY seq""",
+        (batch_id,),
+    ).fetchall()
+    if not remaining:
+        cur.execute(
             """UPDATE replay_batches
                SET status='running', approval_status='approved', approver=?,
                    approved_at=?, approval_reason=NULL, updated_at=?
-               WHERE id=? AND status='pending_approval'
-                 AND approval_status='pending'""",
+               WHERE id=? AND status='pending_approval' AND approval_status='pending'""",
             (operator, now, now, batch_id),
-        ).rowcount
-        if not changed:  # 并发下已被另一笔审批决定（拒绝/超时/取消）
-            raise HTTPException(409, "batch is no longer awaiting approval")
+        )
         audit.record(cur, "replay_batch_approved", None, None,
                      {"replay_batch_id": batch_id, "operator": operator,
-                      "submitted_by": batch["operator"], "note": note.strip(),
+                      "submitted_by": batch["operator"], "note": note,
                       "risk_level": batch["risk_level"]}, ts=now)
-    return {"result": "approved", "batch_id": batch_id, "status": BATCH_RUNNING}
+        return {"batch_status": BATCH_RUNNING, "approval_status": APPROVAL_APPROVED,
+                "remaining_node_ids": []}
+    waiting = [n for n in remaining if n["status"] == NODE_WAITING]
+    if waiting:
+        # 串行链：上一节点满足后激活下一节点，从此时起算其截止时间
+        nxt = waiting[0]
+        node_deadline = now + nxt["timeout_seconds"]
+        cur.execute(
+            """UPDATE replay_approval_nodes SET status='active', activated_at=?,
+               deadline=? WHERE id=? AND status='waiting'""",
+            (now, node_deadline, nxt["id"]),
+        )
+        cur.execute(
+            "UPDATE replay_batches SET approval_deadline=?, updated_at=? WHERE id=?",
+            (node_deadline, now, batch_id),
+        )
+        audit.record(cur, "replay_approval_node_activated", None, None,
+                     {"replay_batch_id": batch_id, "node_id": nxt["id"],
+                      "seq": nxt["seq"], "role": nxt["role"],
+                      "deadline": node_deadline}, ts=now)
+    else:
+        # 并行：批次截止时间收敛为剩余活动节点中最早的截止
+        earliest = min(n["deadline"] for n in remaining if n["deadline"] is not None)
+        cur.execute(
+            "UPDATE replay_batches SET approval_deadline=?, updated_at=? WHERE id=?",
+            (earliest, now, batch_id),
+        )
+    return {"batch_status": BATCH_PENDING_APPROVAL,
+            "approval_status": APPROVAL_PENDING,
+            "remaining_node_ids": [n["id"] for n in remaining]}
+
+
+def decide_node(db: Database, batch_id: int, node_id: int, action: str,
+                operator: str, role: str | None = None,
+                reason: str = "", note: str = "") -> dict:
+    """对单个审批节点做出决定（approve / reject / skip）。
+
+    所有检查与状态转移在同一个写事务里完成（BEGIN IMMEDIATE 串行化并发决定）：
+    节点仍 active 才接受决定（重复/并发决定得到 409，不会产生第二次效果）；
+    审批人不能是批次发起人，不能重复承担同一批次的多个节点，声明的角色必须与
+    节点指定角色一致（'any' 不限）；拒绝立即终止整个批次；批准/跳过推进审批链，
+    全部节点满足后批次才进入 running。
+    """
+    operator = _require_operator(operator, "operator")
+    reason = (reason or "").strip()
+    note = (note or "").strip()
+    if action in ("reject", "skip") and not reason:
+        raise HTTPException(422, f"reason must be non-empty when deciding {action}")
+    new_status = {"approve": NODE_APPROVED, "reject": NODE_REJECTED,
+                  "skip": NODE_SKIPPED}[action]
+    now = time.time()
+    with db.tx() as cur:
+        batch = _get_batch_or_404(db, batch_id)
+        node = cur.execute(
+            "SELECT * FROM replay_approval_nodes WHERE id=? AND batch_id=?",
+            (node_id, batch_id),
+        ).fetchone()
+        if node is None:
+            raise HTTPException(404, "approval node not found")
+        _batch_pending_guard(batch)
+        if operator == batch["operator"]:
+            raise HTTPException(403, "approver must be different from the batch operator")
+        if node["status"] != NODE_ACTIVE:
+            raise HTTPException(
+                409, f"node is {node['status']}, decision no longer accepted")
+        decided_role = (role or "").strip()
+        if node["role"] != ROLE_ANY:
+            if not decided_role:
+                raise HTTPException(422, f"role is required: this node is designated "
+                                         f"to role {node['role']!r}")
+            if decided_role != node["role"]:
+                raise HTTPException(403, f"role {decided_role!r} does not match the "
+                                         f"designated node role {node['role']!r}")
+        elif not decided_role:
+            decided_role = ROLE_ANY
+        # 同一审批人不能重复承担同一批次的多个节点（批准/跳过/拒绝合计只算一次）
+        taken = cur.execute(
+            """SELECT id FROM replay_approval_nodes
+               WHERE batch_id=? AND decided_by=? AND id<>? LIMIT 1""",
+            (batch_id, operator, node_id),
+        ).fetchone()
+        if taken is not None:
+            raise HTTPException(403, f"operator has already decided node "
+                                     f"{taken['id']} of this batch")
+        changed = cur.execute(
+            """UPDATE replay_approval_nodes
+               SET status=?, decided_by=?, decided_role=?, decision_reason=?,
+                   decision_note=?, decided_at=?
+               WHERE id=? AND status='active'""",
+            (new_status, operator, decided_role, reason or None, note or None,
+             now, node_id),
+        ).rowcount
+        if not changed:  # 并发下该节点已被另一笔决定
+            raise HTTPException(409, "node is no longer awaiting decision")
+        audit.record(cur, f"replay_approval_node_{new_status}", None, None,
+                     {"replay_batch_id": batch_id, "node_id": node_id,
+                      "seq": node["seq"], "role": node["role"],
+                      "operator": operator, "decided_role": decided_role,
+                      "reason": reason or None, "note": note or None}, ts=now)
+        if action == "reject":
+            result = _terminate_batch_rejected(cur, batch, operator, reason, note, now)
+        else:
+            result = _advance_chain(cur, batch, operator, note, now)
+    return {"result": new_status, "batch_id": batch_id, "node_id": node_id, **result}
+
+
+def _single_active_node(db: Database, batch_id: int):
+    """批次级（兼容）审批入口的定位：恰好一个节点待决时才能推断决定对象。"""
+    nodes = db.query(
+        "SELECT * FROM replay_approval_nodes WHERE batch_id=? AND status='active' "
+        "ORDER BY seq", (batch_id,))
+    if not nodes:
+        raise HTTPException(409, "batch has no active approval node")
+    if len(nodes) > 1:
+        raise HTTPException(422, "multiple approval nodes are active; "
+                                 "use the node-level endpoints")
+    return nodes[0]
+
+
+def approve(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
+    """批准（批次级兼容入口）：定位当前唯一待决节点并批准。
+
+    单节点批次（含内置默认策略）批准即进入 running；多级链上批准后若仍有
+    后续节点，批次保持 pending_approval 直到全部节点满足。
+    """
+    operator = _require_operator(operator, "operator")
+    batch = _get_batch_or_404(db, batch_id)
+    _batch_pending_guard(batch)
+    node = _single_active_node(db, batch_id)
+    result = decide_node(db, batch_id, node["id"], "approve", operator, note=note)
+    return {"result": "approved", "batch_id": batch_id,
+            "status": result["batch_status"]}
 
 
 def reject(db: Database, batch_id: int, operator: str, reason: str,
            note: str = "") -> dict:
-    """拒绝高风险批次：拒绝原因必填；未执行的任务整体置为终态 cancelled，
-    占住的投递随之释放（之后可以重新提交新批次）。拒绝不可撤销。"""
+    """拒绝（批次级兼容入口）：拒绝当前唯一待决节点，整个批次随之终止。"""
     operator = _require_operator(operator, "operator")
     reason = (reason or "").strip()
     if not reason:
         raise HTTPException(422, "reason must be non-empty when rejecting")
-    now = time.time()
-    with db.tx() as cur:
-        batch = _get_batch_or_404(db, batch_id)
-        _approval_guard(batch, operator)
-        changed = cur.execute(
-            """UPDATE replay_batches
-               SET status='rejected', approval_status='rejected', approver=?,
-                   approval_reason=?, approved_at=NULL, updated_at=?, finished_at=?
-               WHERE id=? AND status='pending_approval'
-                 AND approval_status='pending'""",
-            (operator, reason, now, now, batch_id),
-        ).rowcount
-        if not changed:
-            raise HTTPException(409, "batch is no longer awaiting approval")
-        cancelled_tasks = cur.execute(
-            """UPDATE replay_tasks SET status='cancelled', blocked_reason=NULL,
-               finished_at=?, updated_at=?
-               WHERE batch_id=? AND status IN ('pending','processing')""",
-            (now, now, batch_id),
-        ).rowcount
-        cur.execute(
-            "UPDATE replay_batches SET cancelled=cancelled+?, updated_at=? WHERE id=?",
-            (cancelled_tasks, now, batch_id),
-        )
-        audit.record(cur, "replay_batch_rejected", None, None,
-                     {"replay_batch_id": batch_id, "operator": operator,
-                      "submitted_by": batch["operator"], "reason": reason,
-                      "note": note.strip(), "risk_level": batch["risk_level"],
-                      "cancelled_tasks": cancelled_tasks}, ts=now)
+    batch = _get_batch_or_404(db, batch_id)
+    _batch_pending_guard(batch)
+    node = _single_active_node(db, batch_id)
+    result = decide_node(db, batch_id, node["id"], "reject", operator,
+                         reason=reason, note=note)
     return {"result": "rejected", "batch_id": batch_id,
-            "cancelled_tasks": cancelled_tasks}
+            "cancelled_tasks": result["cancelled_tasks"]}
 
 
 def expire_approvals(db: Database, now: float) -> int:
-    """审批超时释放：超过 approval_deadline 仍待决的高风险批次整体取消。
+    """审批超时释放：任一活动节点超过其截止时间仍待决，整个批次取消。
 
     由 replay worker 每轮在领取任务前调用（也因此可被手动 run_once 触发）。
-    条件更新保证与人工批准/拒绝互斥：谁先提交谁生效，超时不会作用到已批准的
-    批次上；重复扫描不会产生第二次效果。
+    批次与节点的条件更新保证与人工决定互斥：谁先提交谁生效，超时不会作用到
+    已批准/已决定的批次上；重复扫描不会产生第二次效果。
     """
     due = db.query(
-        """SELECT * FROM replay_batches
-           WHERE status='pending_approval' AND approval_status='pending'
-             AND approval_deadline IS NOT NULL AND approval_deadline <= ?""",
+        """SELECT n.id AS node_id, n.batch_id AS batch_id, n.seq AS seq,
+                  n.role AS role, n.deadline AS deadline
+           FROM replay_approval_nodes n
+           JOIN replay_batches b ON b.id = n.batch_id
+           WHERE n.status='active' AND n.deadline IS NOT NULL AND n.deadline <= ?
+             AND b.status='pending_approval' AND b.approval_status='pending'""",
         (now,),
     )
-    for batch in due:
+    for node in due:
         with db.tx() as cur:
             changed = cur.execute(
                 """UPDATE replay_batches
@@ -455,25 +684,42 @@ def expire_approvals(db: Database, now: float) -> int:
                        updated_at=?, finished_at=?
                    WHERE id=? AND status='pending_approval'
                      AND approval_status='pending'""",
-                (now, now, batch["id"]),
+                (now, now, node["batch_id"]),
             ).rowcount
-            if not changed:  # 并发下已被人工批准/拒绝/取消
+            if not changed:  # 并发下批次已被人工批准/拒绝/取消
                 continue
+            cur.execute(
+                """UPDATE replay_approval_nodes SET status='expired', decided_at=?
+                   WHERE id=? AND status='active'""",
+                (now, node["node_id"]),
+            )
+            cur.execute(
+                """UPDATE replay_approval_nodes SET status='cancelled'
+                   WHERE batch_id=? AND status IN ('waiting','active')""",
+                (node["batch_id"],),
+            )
             cancelled_tasks = cur.execute(
                 """UPDATE replay_tasks SET status='cancelled', blocked_reason=NULL,
                    finished_at=?, updated_at=?
                    WHERE batch_id=? AND status IN ('pending','processing')""",
-                (now, now, batch["id"]),
+                (now, now, node["batch_id"]),
             ).rowcount
             cur.execute(
                 "UPDATE replay_batches SET cancelled=cancelled+?, updated_at=? WHERE id=?",
-                (cancelled_tasks, now, batch["id"]),
+                (cancelled_tasks, now, node["batch_id"]),
             )
+            batch = cur.execute("SELECT * FROM replay_batches WHERE id=?",
+                                (node["batch_id"],)).fetchone()
+            audit.record(cur, "replay_approval_node_expired", None, None,
+                         {"replay_batch_id": node["batch_id"],
+                          "node_id": node["node_id"], "seq": node["seq"],
+                          "role": node["role"], "deadline": node["deadline"]}, ts=now)
             audit.record(cur, "replay_batch_approval_expired", None, None,
-                         {"replay_batch_id": batch["id"],
+                         {"replay_batch_id": node["batch_id"],
                           "submitted_by": batch["operator"],
                           "risk_level": batch["risk_level"],
                           "approval_deadline": batch["approval_deadline"],
+                          "expired_node_id": node["node_id"],
                           "cancelled_tasks": cancelled_tasks}, ts=now)
     return len(due)
 
@@ -522,6 +768,12 @@ def cancel(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
                WHERE batch_id=? AND status IN ('pending','processing')""",
             (now, now, batch_id),
         ).rowcount
+        # 待决的审批节点一并关闭（已决定的节点记录保留可查）
+        cur.execute(
+            """UPDATE replay_approval_nodes SET status='cancelled'
+               WHERE batch_id=? AND status IN ('waiting','active')""",
+            (batch_id,),
+        )
         # 滞留的重放副作用按任务分组取消并记审计（内容保留可查）
         stuck = cur.execute(
             """SELECT t.id AS task_id, t.external_id, t.delivery_id, COUNT(o.id) AS c
@@ -645,13 +897,38 @@ def _live_blocked_reason(batch, task, predecessor, in_flight: int,
     return None
 
 
-def _approval_view(row, now: float | None = None) -> dict:
-    """批次当前审批状态与操作者：发起人、审批人、决定时间/原因，以及待决是否已超时。
+def _node_view(node, now: float) -> dict:
+    """单个审批节点的展示：指定角色、实际审批人、截止时间与超时状态。"""
+    return {
+        "id": node["id"],
+        "seq": node["seq"],
+        "role": node["role"],                    # 指定角色（'any' 表示任何非发起人）
+        "status": node["status"],
+        "decided_by": node["decided_by"],        # 实际审批人
+        "decided_role": node["decided_role"],    # 审批人实际承担的角色
+        "decision_reason": node["decision_reason"],
+        "decision_note": node["decision_note"],
+        "timeout_seconds": node["timeout_seconds"],
+        "activated_at": node["activated_at"],
+        "deadline": node["deadline"],
+        "decided_at": node["decided_at"],
+        "expired_on_time": (node["status"] == NODE_ACTIVE
+                            and node["deadline"] is not None
+                            and node["deadline"] <= now),
+    }
+
+
+def _approval_view(db: Database, row, now: float | None = None) -> dict:
+    """批次当前审批状态与操作者：发起人、审批人、决定时间/原因、策略版本、
+    各审批节点（指定角色/实际审批人/截止时间）、当前待决节点、剩余节点与超时状态。
 
     approved/可执行的前提是 approval_status='approved'；expired_on_time 只用于
     详情提示——状态转移以 worker 下一轮扫描（或手动 run_once）为准。
     """
     now = time.time() if now is None else now
+    nodes = db.query(
+        "SELECT * FROM replay_approval_nodes WHERE batch_id=? ORDER BY seq",
+        (row["id"],))
     view = {
         "risk_level": row["risk_level"],
         "approval_note": row["approval_note"],
@@ -666,6 +943,11 @@ def _approval_view(row, now: float | None = None) -> dict:
             and row["approval_status"] == APPROVAL_PENDING
             and row["approval_deadline"] is not None
             and row["approval_deadline"] <= now),
+        "policy_version": row["policy_version"],
+        "nodes": [_node_view(n, now) for n in nodes],
+        # 当前待决节点 / 剩余节点（待决 + 尚未轮到的串行节点）
+        "current_node_ids": [n["id"] for n in nodes if n["status"] == NODE_ACTIVE],
+        "remaining_node_ids": [n["id"] for n in nodes if n["status"] in NODE_UNDECIDED],
     }
     return view
 
@@ -673,6 +955,8 @@ def _approval_view(row, now: float | None = None) -> dict:
 def _batch_view(row) -> dict:
     out = {k: row[k] for k in row.keys()}
     out["filters"] = json.loads(out["filters"])
+    out["policy_snapshot"] = (json.loads(out["policy_snapshot"])
+                              if out["policy_snapshot"] else None)
     return out
 
 
@@ -694,7 +978,7 @@ def batch_detail(db: Database, batch_id: int) -> dict:
     out = _batch_view(batch)
     out["in_flight"] = in_flight  # 当前占用：正在处理的任务数（并发配额的占用量）
     out["waiting"] = waiting      # 等待数量：尚未进入执行的任务数
-    out["approval"] = _approval_view(batch, now)  # 当前审批状态与操作者
+    out["approval"] = _approval_view(db, batch, now)  # 当前审批状态、节点与操作者
     return {"batch": out, "tasks": views}
 
 
@@ -1054,13 +1338,32 @@ def create_replay_router(db: Database, settings: Settings) -> APIRouter:
 
     @router.post("/{batch_id}/approve")
     def approve_endpoint(batch_id: int, req: ApprovalRequest):
-        """批准高风险批次：审批人必须不同于发起人；批准后批次进入 running。"""
+        """批准（批次级兼容入口）：批准当前唯一待决节点；全部节点满足后批次进入 running。"""
         return approve(db, batch_id, req.operator, req.note)
 
     @router.post("/{batch_id}/reject")
     def reject_endpoint(batch_id: int, req: RejectionRequest):
-        """拒绝高风险批次（拒绝原因必填）：未执行任务整体取消，占用随之释放。"""
+        """拒绝（批次级兼容入口，拒绝原因必填）：拒绝当前唯一待决节点，批次整体终止。"""
         return reject(db, batch_id, req.operator, req.reason, req.note)
+
+    @router.post("/{batch_id}/nodes/{node_id}/approve")
+    def approve_node_endpoint(batch_id: int, node_id: int, req: NodeDecisionRequest):
+        """批准指定审批节点：审批人须非发起人、未决定过本批其他节点，
+        声明角色须与节点指定角色一致（'any' 不限）。"""
+        return decide_node(db, batch_id, node_id, "approve", req.operator,
+                           req.role, note=req.note)
+
+    @router.post("/{batch_id}/nodes/{node_id}/reject")
+    def reject_node_endpoint(batch_id: int, node_id: int, req: NodeRejectionRequest):
+        """拒绝指定审批节点（原因必填）：任一节点拒绝即终止整个批次。"""
+        return decide_node(db, batch_id, node_id, "reject", req.operator,
+                           req.role, req.reason, req.note)
+
+    @router.post("/{batch_id}/nodes/{node_id}/skip")
+    def skip_node_endpoint(batch_id: int, node_id: int, req: NodeSkipRequest):
+        """跳过指定审批节点（原因必填，留痕可追溯）：该节点视为已满足，审批链继续推进。"""
+        return decide_node(db, batch_id, node_id, "skip", req.operator,
+                           req.role, req.reason, req.note)
 
     @router.post("/{batch_id}/pause")
     def pause_endpoint(batch_id: int, req: BatchActionRequest):

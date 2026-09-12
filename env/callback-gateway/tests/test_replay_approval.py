@@ -228,7 +228,7 @@ def test_approve_by_different_operator_unblocks_execution(client):
     assert d["approval"]["approved_at"] is not None
     assert d["approval"]["rejection_reason"] is None
 
-    # 批准后的执行照常走，并写完整审计（批准 + processing + done + completed）
+    # 批准后的执行照常走，并写完整审计（节点批准 + 批次放行 + processing + done + completed）
     client.app.state.replay_worker.run_once()
     client.app.state.worker.run_once()
     assert task_for(client, batch_id, "AP-2")["status"] == "done"
@@ -236,7 +236,7 @@ def test_approve_by_different_operator_unblocks_execution(client):
     types = [e["type"] for e in events(client, batch_id)]
     assert types == [
         "replay_batch_created", "replay_task_blocked",
-        "replay_batch_approved",
+        "replay_approval_node_approved", "replay_batch_approved",
         "replay_task_processing", "replay_task_done",
         "replay_batch_completed", "effect_executed"]
     blocked = next(e for e in events(client, batch_id)
