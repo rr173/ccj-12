@@ -25,6 +25,8 @@ from .db import Database
 from .delegation import create_delegation_router
 from .ingest import ingest
 from .keyconfig import KeyConfigStore, KeyRotationService
+from .notif_worker import NotificationWorker
+from .notifications import create_notifications_router
 from .replay import ReplayWorker, create_replay_router
 from .replay_policy import create_policy_router
 from .replay_policy_gate import create_policy_gate_router
@@ -43,6 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     keys = KeyRotationService(key_store, keyring)
     worker = Worker(db, settings)
     replay_worker = ReplayWorker(db, settings)
+    notif_worker = NotificationWorker(db, settings)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -52,9 +55,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.run_worker:
             tasks.append(asyncio.create_task(worker.run_forever()))
             tasks.append(asyncio.create_task(replay_worker.run_forever()))
+            tasks.append(asyncio.create_task(notif_worker.run_forever()))
         yield
         worker.stop()
         replay_worker.stop()
+        notif_worker.stop()
         for task in tasks:
             await task
         db.close()
@@ -65,6 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.keys = keys
     app.state.worker = worker
     app.state.replay_worker = replay_worker
+    app.state.notif_worker = notif_worker
     app.state.settings = settings
 
     @app.post("/callbacks")
@@ -102,6 +108,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db, settings.replay_approval_timeout_seconds,
         settings.replay_policy_change_ttl_seconds))
     app.include_router(create_delegation_router(db))
+    app.include_router(create_notifications_router(
+        db, settings, lambda: notif_worker.senders))
     return app
 
 

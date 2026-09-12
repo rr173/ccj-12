@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from . import audit
+from . import notifications as notif
 from .db import Database
 from .replay_policy import apply_policy_tx, match_rule, validate_policy
 from .replay_rollout import (
@@ -535,6 +536,9 @@ def create_change(db: Database, req: ChangeSubmitRequest, approval_timeout: floa
             "candidate_version": candidate_version,
             "expires_at": now + ttl}, ts=now)
         row = _load_change_or_404(cur, change_id)
+        # 审批通知：需要审批的变更单在同事务内给联系人目录中的可审批人生成待办
+        if row["requires_approval"]:
+            notif.emit_change_required_tx(cur, row, now)
         return 201, {"result": "created", "change": _change_view(cur, row, now)}
 
 
@@ -555,6 +559,62 @@ def _expire_if_due(db: Database, change_id: int, now: float) -> None:
             "change_id": row["id"], "change_type": row["change_type"],
             "operator": row["operator"], "previous_status": row["status"],
             "expires_at": row["expires_at"]}, ts=now)
+        # 审批通知：惰性超时同样告知提交人
+        notif.emit_change_decided_tx(cur, row, "expired", "", "", now)
+
+
+def decide_change_tx(cur: sqlite3.Cursor, change_id: int, action: str,
+                     operator: str, reason: str, note: str, now: float) -> dict:
+    """decide_change 的事务内实现（供 HTTP 端点与待办回写在同一事务内调用）。
+
+    审批人必须不同于提交人；并发决定由写事务串行 + 条件状态转移保证只有一个生效。
+    """
+    row = _load_change_or_404(cur, change_id)
+    if action == "reject" and not (reason or "").strip():
+        raise HTTPException(422, "reason is required to reject a change")
+    # 惰性过期：到期的未决变更按 expired 落定（调用方 _expire_if_due 已在独立
+    # 事务提交过期；走到这里仍开放才继续）
+    if row["status"] not in OPEN_STATUSES or row["expires_at"] <= now:
+        raise HTTPException(409, "change has expired or is no longer open")
+    if action == "approve" and row["status"] != STATUS_PENDING:
+        raise HTTPException(
+            409, f"change is {row['status']}, only pending changes can be approved")
+    if action == "reject" and row["status"] not in OPEN_STATUSES:
+        raise HTTPException(
+            409, f"change is {row['status']}, cannot be rejected")
+    if operator == row["operator"]:
+        raise HTTPException(
+            409, "deciding operator must differ from the change submitter")
+    if action == "approve" and not row["requires_approval"]:
+        raise HTTPException(
+            409, "change does not require approval; the submitter can "
+                 "apply it directly")
+    new_status = STATUS_APPROVED if action == "approve" else STATUS_REJECTED
+    guard = "status='pending'" if action == "approve" \
+        else "status IN ('pending','approved')"
+    changed = cur.execute(
+        f"""UPDATE replay_policy_changes
+            SET status=?, decision=?, decided_by=?, decided_at=?,
+                decision_reason=?, decision_note=?, updated_at=?
+            WHERE id=? AND {guard}""",
+        (new_status, new_status, operator, now,
+         reason or None, (note or "").strip() or None, now, change_id),
+    ).rowcount
+    if not changed:  # 并发下已被另一个决定落定
+        raise HTTPException(409, "change was concurrently decided")
+    audit.record(cur,
+                 "replay_policy_change_approved" if action == "approve"
+                 else "replay_policy_change_rejected",
+                 None, None, {
+                     "change_id": change_id, "change_type": row["change_type"],
+                     "operator": row["operator"], "decided_by": operator,
+                     "risk_class": row["risk_class"],
+                     "reason": reason or None,
+                     "note": (note or "").strip() or None}, ts=now)
+    # 审批通知：批准/拒绝告知提交人（纯告知）
+    notif.emit_change_decided_tx(cur, row, action, operator, reason or None, now)
+    return {"result": new_status,
+            "change": _change_view(cur, _load_change_or_404(cur, change_id), now)}
 
 
 def decide_change(db: Database, change_id: int, action: str, operator: str,
@@ -569,44 +629,7 @@ def decide_change(db: Database, change_id: int, action: str, operator: str,
         raise HTTPException(422, "reason is required to reject a change")
     _expire_if_due(db, change_id, now)
     with db.tx() as cur:
-        row = _load_change_or_404(cur, change_id)
-        if action == "approve" and row["status"] != STATUS_PENDING:
-            raise HTTPException(
-                409, f"change is {row['status']}, only pending changes can be approved")
-        if action == "reject" and row["status"] not in OPEN_STATUSES:
-            raise HTTPException(
-                409, f"change is {row['status']}, cannot be rejected")
-        if operator == row["operator"]:
-            raise HTTPException(
-                409, "deciding operator must differ from the change submitter")
-        if action == "approve" and not row["requires_approval"]:
-            raise HTTPException(
-                409, "change does not require approval; the submitter can "
-                     "apply it directly")
-        new_status = STATUS_APPROVED if action == "approve" else STATUS_REJECTED
-        guard = "status='pending'" if action == "approve" \
-            else "status IN ('pending','approved')"
-        changed = cur.execute(
-            f"""UPDATE replay_policy_changes
-                SET status=?, decision=?, decided_by=?, decided_at=?,
-                    decision_reason=?, decision_note=?, updated_at=?
-                WHERE id=? AND {guard}""",
-            (new_status, new_status, operator, now,
-             reason or None, (note or "").strip() or None, now, change_id),
-        ).rowcount
-        if not changed:  # 并发下已被另一个决定落定
-            raise HTTPException(409, "change was concurrently decided")
-        audit.record(cur,
-                     "replay_policy_change_approved" if action == "approve"
-                     else "replay_policy_change_rejected",
-                     None, None, {
-                         "change_id": change_id, "change_type": row["change_type"],
-                         "operator": row["operator"], "decided_by": operator,
-                         "risk_class": row["risk_class"],
-                         "reason": reason or None,
-                         "note": (note or "").strip() or None}, ts=now)
-        return {"result": new_status,
-                "change": _change_view(cur, _load_change_or_404(cur, change_id), now)}
+        return decide_change_tx(cur, change_id, action, operator, reason, note, now)
 
 
 def apply_change(db: Database, change_id: int, operator: str,
@@ -686,6 +709,9 @@ def apply_change(db: Database, change_id: int, operator: str,
             "candidate_version": row["candidate_version"],
             "approved_by": (row["decided_by"]
                             if row["decision"] == STATUS_APPROVED else None)}, ts=now)
+        # 审批通知：变更已执行，告知提交人（纯告知）
+        applied_row = _load_change_or_404(cur, change_id)
+        notif.emit_change_decided_tx(cur, applied_row, "applied", operator, "", now)
         return {"result": "applied",
                 "change": _change_view(cur, _load_change_or_404(cur, change_id), now)}
 
@@ -712,6 +738,8 @@ def expire_changes(db: Database, now: float) -> int:
                 "change_id": row["id"], "change_type": row["change_type"],
                 "operator": row["operator"], "previous_status": row["status"],
                 "expires_at": row["expires_at"]}, ts=now)
+            # 审批通知：超时告知提交人（纯告知，无可操作待办）
+            notif.emit_change_decided_tx(cur, row, "expired", "", "", now)
             expired += 1
     return expired
 

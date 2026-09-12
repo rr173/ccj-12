@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from . import audit
+from . import notifications as notif
 from .db import Database
 
 DELEGATION_ACTIVE = "active"
@@ -207,11 +208,17 @@ def create_delegation(db: Database, req: DelegationCreateRequest) -> tuple[int, 
             (role, delegatee, operator, valid_from, valid_to, note or None, now, now),
         )
         delegation_id = cur.lastrowid
+        # 通知补发：受托人已是联系人且当前时间窗有效时，为仍 active 的节点上
+        # 尚未处理的可操作事件补发站内待办（晚拿到委托也不漏审批）
+        backfilled = 0
+        if valid_from <= now <= valid_to:
+            backfilled = notif.backfill_for_delegatee(cur, delegatee, now)
         audit.record(cur, "replay_delegation_created", None, None,
                      {"delegation_id": delegation_id, "role": role,
                       "delegatee": delegatee, "operator": operator,
                       "valid_from": valid_from, "valid_to": valid_to,
-                      "note": note or None}, ts=now)
+                      "note": note or None,
+                      "backfilled_todos": backfilled}, ts=now)
     return 201, {"result": "created", "delegation_id": delegation_id,
                  "role": role, "delegatee": delegatee,
                  "valid_from": valid_from, "valid_to": valid_to,
@@ -270,12 +277,17 @@ def reactivate_delegation(db: Database, delegation_id: int,
                revoke_reason=NULL, updated_at=? WHERE id=?""",
             (valid_from, valid_to, note or None, now, delegation_id),
         )
+        # 重新激活后旧票不复活；但仍 active 节点上的待办事件可为该受托人补发
+        backfilled = 0
+        if valid_from <= now <= valid_to:
+            backfilled = notif.backfill_for_delegatee(cur, row["delegatee"], now)
         audit.record(cur, "replay_delegation_reactivated", None, None,
                      {"delegation_id": delegation_id, "role": row["role"],
                       "delegatee": row["delegatee"], "operator": operator,
                       "previous_status": old_status,
                       "valid_from": valid_from, "valid_to": valid_to,
-                      "note": note or None}, ts=now)
+                      "note": note or None,
+                      "backfilled_todos": backfilled}, ts=now)
     return {"result": "reactivated", "delegation_id": delegation_id,
             "valid_from": valid_from, "valid_to": valid_to,
             "current": valid_from <= now <= valid_to}

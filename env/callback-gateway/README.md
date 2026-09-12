@@ -23,9 +23,14 @@
                 │   审批策略版本化维护 /admin/replay-policies/*        │
                 │     候选灰度发布·暂停/恢复/转正/回滚 …/releases/*     │
                 │     影响预览·审批门禁 …/preview …/changes/*           │
-                │   审批委托（生效/失效/撤销/再激活）                    │
+                ├────────────────────────────────────────────────────┤
+                │ 审批通知与待办  /admin/approval-notifications/*        │
+                │   节点激活/投票/临期/拒绝/超时/策略变更 -> 站内待办       │
+                │   邮件 + webhook 双通道；指数退避重试，超限隔离          │
+                │   待办处理回写原审批动作（重复/过期/并发不重复投票）      │
+                │   审批委托（生效/失效/撤销/再激活）                      │
                 │     /admin/replay-delegations/*                      │
-                │   重放副作用走同一 outbox 幂等链路                   │
+                │   重放副作用走同一 outbox 幂等链路                     │
                 └────────────────────────────────────────────────────┘
 ```
 
@@ -79,6 +84,14 @@
 | 失败单独重试、不阻塞其他编号 | 任务级指数退避，超限标记 `failed`，`POST /admin/replays/tasks/{id}/retry` 单条重试 |
 | 重放副作用与正常处理同样的幂等保护 | 重放副作用落同一 `outbox`（`replay_task_id` 标识），幂等键以 `replay:{task_id}` 为作用域，同一派发器 + 下游去重 |
 | 每次重放的完整审计记录 | `GET /admin/replays/{id}/events`（可按单条任务过滤） |
+| 审批节点激活/投票/临期/拒绝/超时/策略变更须通知到人 | `approval_notify_events` + `approval_todos`：按节点角色与当前有效委托解析接收人（'any' 节点/变更单取联系人目录除发起人外成员），见 `app/notifications.py` |
+| 站内待办 + 邮件/webhook 双通道 | 待办始终生成；投递按联系人 `channels` 落 `approval_notification_deliveries`，发送器可注入（默认 noop） |
+| 同一事件同一接收人只一个待办 | 事件 `event_key` 唯一 + `approval_todos UNIQUE(event_id, recipient)`，worker 重复扫描/重启/双击均去重 |
+| 通知失败指数退避重试、超限隔离 | `base*2^(n-1)` 退避、`NOTIF_MAX_ATTEMPTS` 后 `quarantined`，可 `.../deliveries/{id}/requeue`；待办关闭时未发出投递取消 |
+| 待办记录来源/节点/接收人/事件版本/状态 | `approval_todos`：batch_id/change_id、node_id、recipient、event_version、unread/read/handled/expired/cancelled |
+| 处理待办回写原审批动作且防重复/防过期/防并发 | 认领与原决定（`decide_node_tx`/`decide_change_tx`）同一写事务；重复点击/过期/并发均 409，不重复投票、不越过门禁 |
+| 待办看板与多维度查询 | `GET .../summary`（未读/已读/已处理/过期/取消 + 失败/隔离）；`GET .../todos` 按接收人/来源/节点/状态过滤 |
+| 通知全链路审计 | 生成/发送/重试/隔离/确认/回写/关闭均落 `events`（`approval_*` 类型，独立 detail 键不污染批次时间线） |
 | Docker 部署 | `Dockerfile` + `docker-compose.yml` |
 
 ## 快速开始
@@ -92,7 +105,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 121 个端到端测试
+python -m pytest tests/          # 159 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -561,6 +574,83 @@ curl -X POST localhost:8000/admin/replay-delegations/12/reactivate \
 - **失效票**保留为 `invalid`（带 `invalidated_at` 与审计事件），不参与计数、
   不再占位（失效后该受托人可以重新投票或承担本批其他节点）。
 
+## 审批通知与待办分发
+
+在既有重放审批、委托与策略变更链路上，系统按审批事件生成**站内待办**，并通过
+**邮件 / webhook** 两种通道外发通知（`app/notifications.py` + `app/notif_worker.py`）。
+
+```bash
+# 1) 维护联系人目录（站内待办始终生成；email/webhook 为可选外发通道）
+curl -X POST localhost:8000/admin/approval-notifications/contacts \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ops-wang","operator":"ops-admin","channels":["email","webhook"],
+       "email":"wang@example.com","webhook_url":"https://hooks.example.com/approval"}'
+curl localhost:8000/admin/approval-notifications/contacts
+
+# 2) 此后审批链上的事件自动生成待办（无需额外开关）：
+#    - 节点激活：提交即激活的节点 + 串行链逐节点激活；
+#      指定角色节点的接收人 = 该角色当前有效委托的受托人 ∩ 联系人目录；
+#      'any' 节点与策略变更单 = 联系人目录中除发起人外的全部活跃联系人
+#    - 收到投票：法定人数未满时提醒同节点其他可审批人（已投票者不再收）
+#    - 接近截止：worker 扫描，每节点/变更单至多一次（NOTIF_DEADLINE_LEAD_SECONDS）
+#    - 节点拒绝 / 超时 / 批次放行 / 撤回：纯告知待办（发起人；撤回同时告知当前可审批人）
+#    - 策略变更需要审批：变更单 pending 即给可审批人生成可操作待办；
+#      批准/拒绝/超时/执行后给提交人纯告知待办
+
+# 3) 看待办：看板 + 查询（接收人 / 来源 / 状态）
+curl localhost:8000/admin/approval-notifications/summary
+# -> {"unread":1,"read":0,"handled":0,"expired":0,"cancelled":0,
+#     "delivery_failed":0,"delivery_quarantined":0}
+curl 'localhost:8000/admin/approval-notifications/todos?recipient=ops-wang&status=unread'
+curl 'localhost:8000/admin/approval-notifications/todos?source=batch:7'   # batch:{id} / change:{id}
+curl localhost:8000/admin/approval-notifications/todos/12
+
+# 4) 确认已读（幂等）；处理待办即回写原审批动作
+curl -X POST localhost:8000/admin/approval-notifications/todos/12/read \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-wang"}'
+curl -X POST localhost:8000/admin/approval-notifications/todos/12/act \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-wang","action":"approve","role":"ops-lead",
+       "delegation_id":12,"note":"待办里点的批准"}'
+# -> {"result":"handled","todo":{"status":"handled","handle_action":"approve"},
+#     "decision":{"result":"approved","batch_status":"running", ...}}
+# 节点动作：approve / reject（原因必填）/ skip（原因必填）；
+# 变更单动作：approve / reject（原因必填）
+```
+
+- **同一事件对同一接收人至多一个待办**：`approval_notify_events.event_key` 唯一
+  （如 `node:activated:{node_id}`、`deadline:node:{node_id}`、`vote:{vote_id}`、
+  `change:required:{change_id}`），`approval_todos UNIQUE(event_id, recipient)`
+  兜底并发与重放；worker 重复扫描、重复点击、服务重启都不产生第二个待办。
+- **待办记录**：来源批次/变更单（`batch_id`/`change_id`）、节点（`node_id`）、
+  接收人、事件类型与**事件版本**（`event_version`，来源上单调递增）、状态
+  （unread/read/handled/expired/cancelled）、回写的动作与处理人。
+- **回写即原审批**：待办处理与原审批决定在**同一个写事务**内完成——认领待办
+  （条件更新 unread/read）与投票/变更决定原子提交；原决定的全部门禁（角色、
+  委托当前有效、职责分离、节点状态、法定人数、变更单状态）保持不变。
+  重复点击（已 handled/expired/cancelled → 409）、过期待办（来源不再待决时
+  惰性落终态并 409）、并发处理（写事务串行 + 条件认领，单一赢家）都不会
+  重复投票或越过审批门禁；直接在原端点投票的人，其待办由 worker 对账关闭。
+- **晚到不漏**：联系人注册/重新启用、委托创建/重新激活时，为仍可操作的历史
+  事件补发待办（已落定节点/终态批次与变更单不补发，纯告知事件不补发）。
+- **外发投递**：站内待办始终生成；邮件/webhook 按联系人 `channels` 生成投递行，
+  webhook 负载为结构化 JSON（事件、批次/节点/变更单、截止时间等）。失败按
+  `NOTIF_RETRY_BASE_SECONDS * 2^(n-1)`（封顶 `NOTIF_RETRY_CAP_SECONDS`）退避重试，
+  超过 `NOTIF_MAX_ATTEMPTS` 进 `quarantined`，可在
+  `POST .../deliveries/{id}/requeue` 人工重投（重置计数并立即尝试）；待办关闭时
+  未发出的投递同事务取消。发送器可注入（默认 noop，接真实 SMTP/HTTP 时替换
+  `NotificationWorker.senders`）。
+- **看板**：`GET .../summary` 给出未读、已读、已处理、过期（expired）、取消
+  数量，以及外发失败/隔离数量（可按接收人过滤）；列表支持接收人、来源类型/
+  id、节点、状态过滤；每条待办内嵌其投递状态（失败/隔离通道）。
+- **审计**：生成（`approval_notify_event`/`approval_todo_generated`）、发送
+  （`approval_delivery_sent`）、重试与隔离
+  （`approval_delivery_retry_scheduled`/`..._quarantined`/`..._requeued`）、
+  确认与回写（`approval_todo_read`/`..._handled`/
+  `approval_action_written_back`）、待办关闭（`approval_todo_closed`）全部落
+  `events`。通知审计使用独立 detail 键（`source_batch_id`/`change_id`），
+  不进入重放批次按 `replay_batch_id` 过滤的审计时间线。
+
 
 
 ## 配置（环境变量）
@@ -576,6 +666,10 @@ curl -X POST localhost:8000/admin/replay-delegations/12/reactivate \
 | `SIGNATURE_TOLERANCE_SECONDS` | `300` | 签名时间戳容差（防重放） |
 | `REPLAY_APPROVAL_TIMEOUT_SECONDS` | `3600` | 内置默认策略中高风险批次的审批超时（自定义策略后由各节点的 `timeout_seconds` 取代）；超时未决由 worker 自动释放（取消）批次 |
 | `REPLAY_POLICY_CHANGE_TTL_SECONDS` | `3600` | 策略变更单的审批超时：到期未决/未执行的变更由 worker 置为 `expired`，不能再生效 |
+| `NOTIF_RETRY_BASE_SECONDS` | `5` | 审批通知（邮件/webhook）发送失败的重试间隔基数（指数退避） |
+| `NOTIF_RETRY_CAP_SECONDS` | `300` | 审批通知重试间隔上限 |
+| `NOTIF_MAX_ATTEMPTS` | `5` | 审批通知连续发送失败上限，超过进隔离队列（可人工 requeue） |
+| `NOTIF_DEADLINE_LEAD_SECONDS` | `300` | 审批截止前多少秒生成「即将到期」待办（每节点/变更单至多一次） |
 | `RUN_WORKER` | `true` | 是否在本进程跑后台 worker |
 
 ## 设计要点

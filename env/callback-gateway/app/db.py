@@ -34,6 +34,12 @@
                     高风险变更须由不同于提交人的运营审批后才能执行，拒绝/超时/重复
                     提交/并发审批都只是变更单状态转移，执行与配置变更同一事务，
                     不会产生部分生效
+- approval_contacts       审批通知联系人目录：站内待办接收人花名册 + 可选邮件/webhook 通道
+- approval_notify_events  审批通知事件（去重单元：event_key 唯一），带事件版本
+- approval_todos          站内待办：同一事件对同一接收人至多一条；记录来源批次/变更单、
+                    节点、接收人、事件版本与状态；处理后回写原审批动作，重复/过期/
+                    并发处理不重复投票、不越过审批门禁
+- approval_notification_deliveries 邮件/webhook 外发投递：指数退避重试，超限隔离
 """
 from __future__ import annotations
 
@@ -351,6 +357,104 @@ CREATE TABLE IF NOT EXISTS replay_policy_changes (
 );
 CREATE INDEX IF NOT EXISTS idx_replay_policy_changes_status
     ON replay_policy_changes(status, expires_at);
+
+-- 审批通知联系人目录：站内待办的接收人花名册（指定角色节点的通知对象还须持有当前
+-- 有效的角色委托）。email/webhook 为可选外发通道，inbox（站内待办）始终生成。
+CREATE TABLE IF NOT EXISTS approval_contacts (
+    name        TEXT PRIMARY KEY,          -- 运营人员标识（与批次/变更单 operator、委托受托人同一命名空间）
+    email       TEXT,                      -- 邮件通道地址（channels 含 email 时必填）
+    webhook_url TEXT,                      -- webhook 通道地址（channels 含 webhook 时必填）
+    channels    TEXT NOT NULL DEFAULT '[]', -- 启用的外发通道 JSON：子集 ["email","webhook"]；站内待办不受此限
+    active      INTEGER NOT NULL DEFAULT 1,-- 1 接收新通知；停用后不再生成待办，未处理待办关闭
+    created_by  TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    deactivated_at REAL,
+    deactivated_by TEXT
+);
+
+-- 审批通知事件：去重单元。event_key 唯一（如 node:activated:{node_id}、
+-- deadline:{node_id}、vote:{vote_id}、change:required:{change_id}），同一事件
+-- 重放/并发触发只落一行；state_version 为该来源（批次/变更单）上事件的单调版本号。
+CREATE TABLE IF NOT EXISTS approval_notify_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key     TEXT NOT NULL UNIQUE,
+    event_type    TEXT NOT NULL,  -- activated|vote_received|deadline_approaching|
+                                  -- node_rejected|node_timeout|batch_approved|
+                                  -- batch_cancelled|change_required|change_approved|
+                                  -- change_rejected|change_expired|change_applied
+    source_type   TEXT NOT NULL,  -- batch | change
+    batch_id      INTEGER REFERENCES replay_batches(id),
+    change_id     INTEGER REFERENCES replay_policy_changes(id),
+    node_id       INTEGER,        -- 批次审批节点事件的节点 id
+    roles         TEXT NOT NULL DEFAULT '[]',  -- 事件对应节点的允许角色快照（'any' 为通配）
+    actionable    INTEGER NOT NULL DEFAULT 1,  -- 1=待办可回写审批动作；0=纯告知
+    state_version INTEGER NOT NULL DEFAULT 1,  -- 来源上的事件版本（单调递增）
+    subject       TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    payload       TEXT NOT NULL DEFAULT '{}',  -- webhook 通道的结构化负载
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notify_events_batch ON approval_notify_events(batch_id);
+CREATE INDEX IF NOT EXISTS idx_notify_events_change ON approval_notify_events(change_id);
+CREATE INDEX IF NOT EXISTS idx_notify_events_node ON approval_notify_events(node_id);
+
+-- 站内待办：每个事件对每个接收人至多一条（UNIQUE(event_id, recipient) 兜底并发/重放）。
+-- 记录来源批次/变更单、节点、接收人、事件版本与状态机；处理后回写原审批动作
+-- （handle_action），重复处理/过期待办/并发处理由条件更新与来源门禁挡下。
+CREATE TABLE IF NOT EXISTS approval_todos (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id      INTEGER NOT NULL REFERENCES approval_notify_events(id),
+    recipient     TEXT NOT NULL,              -- 接收人（联系人名 / 发起人）
+    status        TEXT NOT NULL DEFAULT 'unread',  -- unread|read|handled|expired|cancelled
+    source_type   TEXT NOT NULL,              -- batch | change（冗余自事件，便于按来源查询）
+    batch_id      INTEGER,
+    change_id     INTEGER,
+    node_id       INTEGER,
+    event_type    TEXT NOT NULL,
+    event_version INTEGER NOT NULL,           -- 生成时的事件版本（乐观门禁/展示）
+    actionable    INTEGER NOT NULL DEFAULT 1,
+    title         TEXT NOT NULL,
+    read_at       REAL,
+    handled_at    REAL,
+    handled_by    TEXT,
+    handle_action TEXT,                        -- 回写的原审批动作：approve|reject|skip
+    close_reason  TEXT,
+    closed_at     REAL,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    UNIQUE (event_id, recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_todos_recipient
+    ON approval_todos(recipient, status);
+CREATE INDEX IF NOT EXISTS idx_approval_todos_source
+    ON approval_todos(source_type, batch_id, change_id);
+CREATE INDEX IF NOT EXISTS idx_approval_todos_status ON approval_todos(status);
+CREATE INDEX IF NOT EXISTS idx_approval_todos_node ON approval_todos(node_id);
+
+-- 外发通知（邮件/webhook）：每条待办按联系人启用通道生成；失败按指数退避重试
+-- （base*2^(attempts-1)，封顶），超过次数进 quarantine；待办关闭时未发出的投递取消。
+CREATE TABLE IF NOT EXISTS approval_notification_deliveries (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    todo_id       INTEGER NOT NULL REFERENCES approval_todos(id),
+    recipient     TEXT NOT NULL,
+    channel       TEXT NOT NULL,              -- email | webhook
+    address       TEXT NOT NULL,              -- email: 邮箱；webhook: URL
+    subject       TEXT,
+    body          TEXT,
+    payload       TEXT,                       -- webhook 的 JSON 负载
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|sent|failed|quarantined|cancelled
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    next_retry_at REAL,
+    last_error    TEXT,
+    sent_at       REAL,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_deliveries_pick
+    ON approval_notification_deliveries(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_notif_deliveries_todo
+    ON approval_notification_deliveries(todo_id);
 """
 
 
