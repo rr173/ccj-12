@@ -170,8 +170,13 @@ class ReplayPolicyStore:
         self._db = db
 
     def record_applied(self, operator: str, rules: list[dict]) -> tuple[int, float]:
-        """在一个事务里分配新版本号、写入 applied 记录并落审计事件，返回 (版本号, 时间)。"""
+        """在一个事务里分配新版本号、写入 applied 记录、整份切换各风险等级稳定指针
+        （并关闭未结束的灰度发布）并落审计事件，返回 (版本号, 时间)。
+
+        灰度分流见 replay_rollout.py：稳定指针与发布单的更新和策略版本写入同事务，
+        并发的批次提交只会看到完整的旧状态或完整的新状态，不会读到半成品。"""
         now = time.time()
+        from . import replay_rollout
         with self._db.tx() as cur:
             row = cur.execute("SELECT MAX(version) AS v FROM replay_policy_versions").fetchone()
             version = (row["v"] or 0) + 1
@@ -186,6 +191,7 @@ class ReplayPolicyStore:
             audit.record(cur, "replay_policy_applied", None, None,
                          {"version": version, "operator": operator,
                           "rules": len(rules)}, ts=now)
+            replay_rollout.apply_full_policy(cur, version, rules, operator, now)
             return version, now
 
     def record_rejected(self, operator: str, raw_policy: str, reasons: list[str]) -> None:
@@ -209,14 +215,6 @@ class ReplayPolicyStore:
     def history(self, limit: int) -> list[sqlite3.Row]:
         return self._db.query(
             "SELECT * FROM replay_policy_versions ORDER BY id DESC LIMIT ?", (limit,))
-
-
-def resolve_rules(db: Database, approval_timeout_seconds: float) -> tuple[int | None, list[dict]]:
-    """当前生效的规则集：(策略版本号, 规则列表)；无已生效策略时用内置默认策略（版本 None）。"""
-    row = ReplayPolicyStore(db).current_applied()
-    if row is None:
-        return None, builtin_default_rules(approval_timeout_seconds)
-    return row["version"], json.loads(row["policy"])["rules"]
 
 
 def submit_policy(db: Database, raw_body: bytes) -> tuple[int, dict]:
@@ -247,14 +245,22 @@ def submit_policy(db: Database, raw_body: bytes) -> tuple[int, dict]:
 
 
 def current_policy(db: Database, approval_timeout_seconds: float) -> dict:
-    """当前生效策略视图：已生效版本，或内置默认策略（version=None）。"""
+    """当前生效策略视图：已生效版本，或内置默认策略（version=None）。
+
+    附带灰度视图 rollout：每个风险等级的稳定版本、上一稳定版本与未结束的候选发布。
+    """
+    from . import replay_rollout
     row = ReplayPolicyStore(db).current_applied()
     if row is None:
-        return {"version": None, "source": "builtin_default",
+        body = {"version": None, "source": "builtin_default",
                 "policy": {"rules": builtin_default_rules(approval_timeout_seconds)}}
-    return {"version": row["version"], "source": "applied",
-            "operator": row["operator"], "applied_at": row["created_at"],
-            "policy": json.loads(row["policy"])}
+    else:
+        body = {"version": row["version"], "source": "applied",
+                "operator": row["operator"], "applied_at": row["created_at"],
+                "policy": json.loads(row["policy"])}
+    with db.tx() as cur:
+        body["rollout"] = replay_rollout.current_rollout_view(cur, approval_timeout_seconds)
+    return body
 
 
 def policy_history(db: Database, limit: int) -> dict:

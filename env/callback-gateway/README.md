@@ -21,6 +21,7 @@
                 │ 业务重放层  /admin/replays/*                        │
                 │   筛选预览 → 批量提交 → 多级审批 → 暂停/继续/取消     │
                 │   审批策略版本化维护 /admin/replay-policies/*        │
+                │     候选灰度发布·暂停/恢复/转正/回滚 …/releases/*     │
                 │   审批委托（生效/失效/撤销/再激活）                    │
                 │     /admin/replay-delegations/*                      │
                 │   重放副作用走同一 outbox 幂等链路                   │
@@ -54,6 +55,12 @@
 | 委托到期/撤销后未满足节点重新等待，已落定节点不改写 | worker 每轮先扫委托到期；失效/撤销委托投在仍 `active` 节点上的赞成票置 `invalid`，有效人数回退、缺额重新等待；已达法定人数/拒绝/跳过/超时的节点永不改写 |
 | 任一节点拒绝即终止批次，全部节点满足才放行 | 节点拒绝 → 批次 `rejected`、未执行任务整体取消；全部节点达到法定人数（或有理由跳过）→ 批次才进 `running`，worker 与 outbox 派发闸门口径不变 |
 | 批次保存提交时的策略快照 | `replay_batches.policy_version` + `policy_snapshot`（规则/模式/节点规格含角色与法定人数）；策略更新只影响新提交的批次 |
+| 同一风险等级维护多个候选策略并灰度分流 | `replay_policy_releases`：候选版本 + 批次规模闸门（`min_size/max_size`）+ `rollout_percent` 百分比分流；桶 `sha256(risk_level|分流键)%100`（分流键取 `request_id`，否则取本批投递 id 集合），重复提交/重启命中结果不变，见 `app/replay_rollout.py` |
+| 候选策略发布前试运行校验 | `POST /admin/replay-policies/evaluate`：只读预演车道/bucket/命中版本与稳定/候选各自的规则节点链，不落数据 |
+| 候选可暂停/恢复/转正/回滚 | `.../releases/{id}/pause|resume|promote|rollback`；暂停即停分流（新批次全走稳定版本）；转正把该风险等级稳定指针整份切到候选；回滚恢复上一稳定版本（原因必填），只影响之后的新提交，已生成审批节点的批次凭快照不变 |
+| 批次记录命中的策略版本/分流规则/发布批次 | `replay_batches.policy_lane`（stable/candidate）+ `rollout_id` + `rollout_seq`；`policy_snapshot.routing` 存闸门/百分比/bucket/分流键，提交响应与批次详情直接可见 |
+| 详情与策略历史展示稳定版本/候选版本/分流命中/暂停回滚原因 | `GET .../replay-policies/current` 附 `rollout`（每等级稳定/上一稳定版本 + 开放中的候选发布）；`GET .../releases` / `.../releases/{id}` 含状态、暂停/回滚原因与命中统计；批次详情 `approval.policy_routing` |
+| 灰度发布与命中全程审计、并发无跨版本快照 | `replay_policy_release_published/paused/resumed/promoted/rolled_back/superseded` + 每批次 `replay_policy_batch_routed`；版本解析在批次写事务（BEGIN IMMEDIATE）内与发布变更串行，快照与列必来自同一份发布状态 |
 | 详情展示每节点已批准人数/法定人数/有效委托/缺额 | 批次详情 `approval.nodes`：`approved_count`、`required_approvals`、`missing`、`quorum_reached`、`valid_delegations`（允许角色当前有效的委托）、每张票（含已失效票）；另有批次级 `missing_approvals` |
 | 委托与决定全生命周期可审计 | `replay_delegation_created`/`revoked`/`reactivated`/`expired`、`replay_node_vote_invalidated`、`replay_approval_node_quorum_lost` + 既有节点/批次事件；节点可带原因跳过（视为满足，留痕） |
 | 审批结果/拒绝原因/超时释放/批准后执行全部可审计 | `replay_batch_approved` / `replay_batch_rejected`（含 reason）/ `replay_batch_approval_expired` + 既有执行事件；批次详情含 `approval`（状态、发起人、审批人、批准时间、拒绝原因、截止时间） |
@@ -80,7 +87,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 106 个端到端测试
+python -m pytest tests/          # 121 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -312,6 +319,91 @@ curl -X POST localhost:8000/admin/replay-policies \
 curl localhost:8000/admin/replay-policies/versions
 ```
 
+### 审批策略灰度发布与回滚
+
+整份提交是「立即全量生效」。需要先小流量验证新策略时，运营可以为**同一风险等级**
+把某个已生效版本作为**候选**灰度：按**批次规模闸门**（`min_size`/`max_size`）与
+**分流百分比**（`rollout_percent` 1-100）把新提交的批次逐步引流到候选版本；
+稳定版本继续承接未命中的全部流量。候选可暂停、恢复、转正、回滚。
+
+```bash
+# 0) 先把候选策略作为一个正式版本提交（立即全量没关系——下一步再灰度一个旧版本，
+#    或直接提交两个版本后把新版本发成候选；下面以 v2 稳定、v3 候选为例）
+curl -X POST localhost:8000/admin/replay-policies -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-li","policy":{"rules": [...]}}'   # -> version 2（稳定）
+curl -X POST localhost:8000/admin/replay-policies -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-li","policy":{"rules": [...]}}'   # -> version 3
+# v3 是新版本，再把稳定策略作为 v4 整份提交（稳定指针=v4），随后把 v3 发成候选
+
+# 1) 发布灰度：高风险、规模 1-20 条的批次 30% 走候选 v3（第 1 批发布）
+curl -X POST localhost:8000/admin/replay-policies/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-rel","risk_level":"high","candidate_version":3,
+       "rollout_percent":30,"min_size":1,"max_size":20,"note":"小批先试"}'
+# -> {"result":"published","release_id":1,"rollout_seq":1,
+#     "candidate_version":3,"stable_version":4,"status":"candidate", ...}
+
+# 1b) 发布前试运行校验（只读，不落数据）：预演某个批次会命中哪个车道/版本/规则
+curl -X POST localhost:8000/admin/replay-policies/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"risk_level":"high","total":12,"request_id":"req-20260912-7"}'
+# -> {"would_hit_lane":"candidate","would_use_version":3,"routing_reason":"matched_candidate",
+#     "bucket":7,"routing_key":"req:req-20260912-7",
+#     "stable_rule":{...},"candidate_rule":{规则名/模式/节点链...},
+#     "release":{闸门/百分比/命中统计...}}
+
+# 2) 正常提交批次即可；响应直接带分流命中（policy_lane/rollout_id/rollout_seq/bucket）
+curl -X POST localhost:8000/admin/replays -H 'Content-Type: application/json' \
+  -d '{"delivery_ids":[12],"operator":"ops-li","reason":"补发","risk_level":"high",
+       "approval_note":"...","request_id":"req-20260912-7"}'
+# -> {"policy_version":3,"policy_lane":"candidate","rollout_id":1,"rollout_seq":1,
+#     "routing_bucket":7,"approval_nodes":2, ...}
+
+# 3) 观察：当前稳定版本/上一稳定版本/开放中的候选（含命中数）；发布单列表与详情
+curl localhost:8000/admin/replay-policies/current          # 含 rollout.risk_levels.*
+curl 'localhost:8000/admin/replay-policies/releases?risk_level=high'
+curl localhost:8000/admin/replay-policies/releases/1       # 含 hits / pause_reason / rollback_reason
+
+# 4) 异常时暂停（原因必填）：立即停止分流，之后新提交全走稳定版本；
+#    已命中候选、已生成审批节点的批次继续按候选快照审批，不受影响
+curl -X POST localhost:8000/admin/replay-policies/releases/1/pause \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-rel","reason":"候选审批链异常率升高"}'
+curl -X POST localhost:8000/admin/replay-policies/releases/1/resume \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-rel"}'
+
+# 5) 转正：该风险等级稳定版本整份切到候选（上一稳定版本记录为回滚目标）
+curl -X POST localhost:8000/admin/replay-policies/releases/1/promote \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-rel"}'
+
+# 6) 回滚（原因必填）：灰度中回滚=关闭发布单、全部新批次走稳定版本；
+#    转正后回滚=稳定指针恢复为上一稳定版本。只影响之后的新提交——
+#    已经生成审批节点的批次持有自己的策略快照，永不改变
+curl -X POST localhost:8000/admin/replay-policies/releases/1/rollback \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-rel","reason":"紧急止损"}'
+```
+
+- **确定性分流**：是否命中候选只取决于 `(风险等级, 分流键, 规模闸门, 百分比)`——
+  分流键优先取提交幂等键 `request_id`，否则取本批选中投递 id 的有序集合；
+  `bucket = sha256(risk_level|分流键) 前 12 位 % 100`，`bucket < percent` 命中。
+  结果与提交时刻、服务重启无关；同一 `request_id` 重复提交必然看到同一车道。
+  批次落盘时把命中版本、车道、发布单与发布批次序号、闸门/百分比/bucket 全部固化到
+  `policy_lane`/`rollout_id`/`rollout_seq` 与 `policy_snapshot.routing`，
+  之后发布单暂停、调百分比或回滚都不改变已落盘批次。
+- **同一风险等级至多一条未结束灰度**（candidate/paused；部分唯一索引 + 写事务串行
+  兜底并发发布）。`rollout_seq` 是该等级的发布批次序号，单调递增、随批次留痕。
+- **发布校验**：候选版本必须是已 applied 的版本、不能等于当前稳定版本；候选策略必须
+  有规则覆盖该风险等级且规则规模区间与声明闸门相交（否则被引入候选车道的批次会
+  无规则匹配，直接拒绝发布 `candidate_policy_does_not_cover_gate`）。
+- **fail closed 不变**：无论命中哪条车道，高风险批次在该版本下无规则匹配仍以
+  `no_applicable_policy` 拒绝提交（响应附带命中的车道与版本），不会因分流静默降低
+  审批要求。
+- **整份提交与灰度的关系**：`POST /admin/replay-policies` 仍整份生效——两个风险等级
+  的稳定指针同事务切到新版本，当时尚未结束的灰度发布单整份关闭为 `superseded`
+  （写审计）；切换与批次提交在写事务里串行，批次不会读到无版本或前后版本混搭的快照。
+- **并发安全**：批次的版本解析发生在批次写事务内部（`BEGIN IMMEDIATE`，所有写事务
+  串行），与发布/暂停/恢复/转正/回滚/整份切换互斥；解析到的版本与落盘的节点链、
+  快照必然来自同一份发布状态。
+
 - **节点链随批次落盘（策略快照）**：提交时解析出的规则与节点规格（含允许角色与
   法定人数）保存在 `replay_batches.policy_snapshot`（连同 `policy_version`），
   审批节点行一次性生成——之后策略再更新也**不改变已提交的批次**，只影响新提交。
@@ -436,8 +528,13 @@ curl -X POST localhost:8000/admin/replay-delegations/12/reactivate \
   `replay_batch_id`/`replay_task_id`，一批重放的完整轨迹一次查全；重放任务只引用
   落盘原文（delivery_id），不复制内容，原始版本永不改写。
 - **审批策略快照隔离**：批次提交时把所采用策略的版本与解析结果（规则、模式、
-  节点规格）随批次落盘，审批节点行一次性生成；策略版本化演进只影响新提交，
-  已提交批次的审批链、角色与截止时间全程不变，事后可对照快照追溯每一次决定。
+  节点规格、灰度车道与分流规则）随批次落盘，审批节点行一次性生成；策略版本化演进、
+  灰度发布/暂停/回滚只影响新提交，已提交批次的审批链、角色与截止时间全程不变，
+  事后可对照快照追溯每一次决定。
+- **灰度分流确定性**：分流桶是 `(风险等级, 分流键)` 的稳定哈希（分流键=request_id
+  或本批投递 id 集合），与提交时机和进程无关；选版本在批次写事务内完成，发布/
+  暂停/回滚/整份切换与批次提交串行，稳定指针与发布单的更新对每个批次要么是完整旧
+  状态、要么是完整新状态，不存在「无版本」或跨版本节点链。
 - **并发配额实时推导**：批次占用量 = 该批 `processing` 任务数，领取与复核在同一
   写事务里完成（SQLite 写事务串行，多副本也不会超领）；不维护任何计数器，
   因此暂停/取消/崩溃重启都不存在「忘了释放」的路径。
@@ -448,4 +545,7 @@ curl -X POST localhost:8000/admin/replay-delegations/12/reactivate \
   `approved_at`/`approval_deadline` 列（存量批次视为普通风险、无需审批，状态不变），
   再补 `policy_version`/`policy_snapshot` 列并新建 `replay_policy_versions`/
   `replay_approval_nodes` 表；老库中仍待决的批次自动合成一个内置默认节点
-  （沿用原截止时间），升级后可照常批准/拒绝/超时，无需手工迁移。
+  （沿用原截止时间），升级后可照常批准/拒绝/超时，无需手工迁移。灰度功能再打开时
+  补 `policy_lane`/`rollout_id`/`rollout_seq` 列与 `replay_policy_stable`/
+  `replay_policy_releases` 表：已有 applied 策略时按最近版本为每个风险等级回填稳定
+  指针（行为与升级前一致），从未提交过策略则继续走内置默认；老批次一律视为稳定车道。

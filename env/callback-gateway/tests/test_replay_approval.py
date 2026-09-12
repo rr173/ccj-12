@@ -235,7 +235,7 @@ def test_approve_by_different_operator_unblocks_execution(client):
     assert detail(client, batch_id)["batch"]["status"] == "completed"
     types = [e["type"] for e in events(client, batch_id)]
     assert types == [
-        "replay_batch_created", "replay_task_blocked",
+        "replay_batch_created", "replay_policy_batch_routed", "replay_task_blocked",
         "replay_approval_node_approved", "replay_batch_approved",
         "replay_task_processing", "replay_task_done",
         "replay_batch_completed", "effect_executed"]

@@ -387,7 +387,8 @@ def test_serial_chain_full_flow_with_roles_and_audit(client):
     assert detail(client, batch_id)["batch"]["status"] == "completed"
     types = event_types(client, batch_id)
     assert types == [
-        "replay_batch_created", "replay_task_blocked",  # 阻塞原因不变，轮询不重复刷
+        "replay_batch_created", "replay_policy_batch_routed",
+        "replay_task_blocked",  # 阻塞原因不变，轮询不重复刷
         "replay_approval_node_approved", "replay_approval_node_activated",
         "replay_approval_node_approved", "replay_batch_approved",
         "replay_task_processing", "replay_task_done",

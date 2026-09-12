@@ -27,6 +27,7 @@ from .ingest import ingest
 from .keyconfig import KeyConfigStore, KeyRotationService
 from .replay import ReplayWorker, create_replay_router
 from .replay_policy import create_policy_router
+from .replay_rollout import create_rollout_router
 from .security import KeyRingManager
 from .worker import Worker
 
@@ -95,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(create_admin_router(db, keys))
     app.include_router(create_replay_router(db, settings))
     app.include_router(create_policy_router(db, settings.replay_approval_timeout_seconds))
+    app.include_router(create_rollout_router(db, settings.replay_approval_timeout_seconds))
     app.include_router(create_delegation_router(db))
     return app
 

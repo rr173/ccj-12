@@ -15,6 +15,12 @@
                    带版本时间快照（同编号有序执行的排序键）与最近阻塞原因（审计去重用）
 - replay_policy_versions  审批策略每次变更/尝试的记录（版本、操作者、时间、结果）；
                     提交批次时按当前生效策略生成审批节点，已提交批次不受后续变更影响
+- replay_policy_stable    每个风险等级当前的稳定策略版本（灰度回滚的目标版本；
+                    候选试运行/灰度期间它继续承接未命中候选的全部流量）
+- replay_policy_releases  候选策略灰度发布单：风险等级、候选版本、批次规模闸门、
+                    分流百分比、批次序号（单调递增）与生命周期
+                    （candidate/paused/promoted/rolled_back/superseded）；
+                    分流结果只取决于等级/编号/闸门/百分比，重复提交与重启保持不变
 - replay_approval_nodes   批次的多级审批节点：允许承担的角色列表、法定人数
                     （required_approvals）、实际审批人、截止时间；串行链逐节点激活，
                     并行节点同时待决；节点有效赞成票达到法定人数才满足，任一拒绝/
@@ -126,8 +132,11 @@ CREATE TABLE IF NOT EXISTS replay_batches (
     approval_reason  TEXT,             -- 拒绝原因（拒绝时必填）
     approved_at      REAL,             -- 明确批准的时间（epoch 秒）；NULL 表示尚未批准
     approval_deadline REAL,            -- 当前待决节点的审批截止时间（= 活动节点最早截止）；超时未决由 worker 释放
-    policy_version INTEGER,            -- 提交时采用的审批策略版本；NULL 表示内置默认策略
-    policy_snapshot TEXT,              -- 提交时解析出的策略快照 JSON（规则/模式/节点规格），策略更新不影响本批
+    policy_version INTEGER,            -- 提交时命中的审批策略版本；NULL 表示内置默认策略
+    policy_snapshot TEXT,              -- 提交时解析出的策略快照 JSON（规则/模式/节点规格/分流命中），策略更新不影响本批
+    policy_lane  TEXT NOT NULL DEFAULT 'stable',  -- 分流命中：stable|candidate（命中的是稳定版本还是灰度候选）
+    rollout_id   INTEGER REFERENCES replay_policy_releases(id),  -- 命中的灰度发布单（稳定流量为 NULL）
+    rollout_seq  INTEGER,              -- 提交时该风险等级的发布批次序号（第几次灰度发布，随批次留痕）
     total       INTEGER NOT NULL DEFAULT 0,       -- 进度：任务总数 / 各终态计数
     done        INTEGER NOT NULL DEFAULT 0,
     failed      INTEGER NOT NULL DEFAULT 0,
@@ -172,6 +181,57 @@ CREATE TABLE IF NOT EXISTS replay_policy_versions (
     reason      TEXT,                  -- rejected 的校验失败原因（JSON 数组）
     created_at  REAL NOT NULL
 );
+
+-- 每个风险等级当前的稳定审批策略版本。整份策略提交（POST replay-policies）后，其规则
+-- 覆盖到的风险等级在这里整份切换；候选灰度转正（promote）只切换对应等级这一行。
+-- 回滚 = 把这一行改回上一稳定版本（promote/整份切换时记 prev 版本），只影响之后的新提交。
+CREATE TABLE IF NOT EXISTS replay_policy_stable (
+    risk_level   TEXT PRIMARY KEY,     -- high | normal
+    policy_version INTEGER,            -- 稳定策略版本号；NULL = 内置默认策略
+    rule_name    TEXT,                 -- 该等级在稳定策略中命中的规则名（便于展示）
+    prev_policy_version INTEGER,       -- 上一稳定版本（回滚目标；NULL 表示无更早版本）
+    updated_by   TEXT NOT NULL,
+    updated_at   REAL NOT NULL,
+    reason       TEXT                  -- 最近一次切换/回滚原因
+);
+
+-- 候选策略灰度发布单：同一风险等级至多一条未结束（candidate/paused）的发布。
+-- 分流由 risk_level + min_size/max_size（批次规模闸门）+ rollout_percent（百分比）
+-- 决定，结果对同一批次恒定（稳定哈希），与提交时机、重启无关。
+CREATE TABLE IF NOT EXISTS replay_policy_releases (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    risk_level  TEXT NOT NULL,         -- 灰度针对的风险等级：high | normal
+    rollout_seq INTEGER NOT NULL,      -- 该风险等级的发布批次序号（从 1 单调递增）
+    candidate_version INTEGER NOT NULL,-- 候选策略版本号（replay_policy_versions.version）
+    candidate_rule_name TEXT,          -- 候选策略中该等级将命中的规则名（试运行校验时确认）
+    stable_version_at_publish INTEGER, -- 发布时该等级的稳定版本快照（NULL=内置默认；展示/审计用）
+    min_size    INTEGER,               -- 批次规模闸门：任务条数下限（NULL=不限）
+    max_size    INTEGER,               -- 批次规模闸门：任务条数上限（NULL=不限）
+    rollout_percent INTEGER NOT NULL,  -- 命中闸门的批次分流到候选的百分比（1-100）
+    status      TEXT NOT NULL,         -- candidate|paused|promoted|rolled_back|superseded
+    operator    TEXT NOT NULL,         -- 发布人
+    note        TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    paused_at   REAL,
+    paused_by   TEXT,
+    pause_reason TEXT,
+    promoted_at REAL,
+    promoted_by TEXT,
+    rolled_back_at REAL,
+    rolled_back_by TEXT,
+    rollback_reason TEXT,              -- 回滚原因（必填，随发布单与审计留痕）
+    superseded_at REAL,
+    superseded_by TEXT
+);
+-- 同一风险等级至多一条未结束的灰度发布（部分唯一索引兜底并发发布）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_replay_policy_releases_open
+    ON replay_policy_releases(risk_level)
+    WHERE status IN ('candidate','paused');
+CREATE INDEX IF NOT EXISTS idx_replay_policy_releases_status
+    ON replay_policy_releases(status);
+CREATE INDEX IF NOT EXISTS idx_replay_policy_releases_level_seq
+    ON replay_policy_releases(risk_level, rollout_seq);
 
 -- 批次的多级审批节点：提交时按策略快照一次性生成，之后不随策略变更而改变。
 -- 串行链：只有当前节点 active，上一节点满足后才激活下一节点（激活时才起算截止时间）；
@@ -264,6 +324,32 @@ class Database:
             self._conn.executescript(SCHEMA)
             self._migrate_pending_approval_nodes()   # 依赖新表，必须在 SCHEMA 之后
             self._migrate_node_votes()               # 法定人数/投票：回填老库已落定节点的票
+            self._migrate_stable_pointers()          # 灰度：按最近 applied 策略补每个等级的稳定指针
+
+    def _migrate_stable_pointers(self):
+        """灰度功能引入前的老库：没有稳定指针表数据。按最近一次 applied 策略为每个
+        风险等级补一条稳定指针（该策略即当时的「整份生效」策略，行为与升级前一致：
+        两个等级都解析到同一版本；从未提交过策略时不补——继续走内置默认策略）。"""
+        latest = self._conn.execute(
+            "SELECT MAX(version) AS v FROM replay_policy_versions WHERE result='applied'"
+        ).fetchone()["v"]
+        if latest is None:
+            return
+        existing = {r["risk_level"] for r in self._conn.execute(
+            "SELECT risk_level FROM replay_policy_stable")}
+        now_rows = self._conn.execute(
+            "SELECT created_at FROM replay_policy_versions WHERE version=? LIMIT 1",
+            (latest,)).fetchone()
+        created_at = now_rows["created_at"] if now_rows else 0.0
+        for level in ("high", "normal"):
+            if level in existing:
+                continue
+            self._conn.execute(
+                """INSERT INTO replay_policy_stable
+                   (risk_level, policy_version, rule_name, prev_policy_version,
+                    updated_by, updated_at, reason)
+                   VALUES (?,?,NULL,NULL,'migration',?,'backfilled_from_latest_applied')""",
+                (level, latest, created_at))
 
     def _migrate_pending_approval_nodes(self):
         """老库中仍待决的高风险批次没有审批节点行：补一个内置默认节点
@@ -336,6 +422,10 @@ class Database:
                 # 多级审批策略：老库批次没有策略快照（NULL = 内置默认策略/早于策略功能）
                 ("policy_version", "INTEGER"),
                 ("policy_snapshot", "TEXT"),
+                # 灰度分流：老批次视为稳定车道、无发布单
+                ("policy_lane", "TEXT NOT NULL DEFAULT 'stable'"),
+                ("rollout_id", "INTEGER"),
+                ("rollout_seq", "INTEGER"),
             ):
                 if name not in cols:
                     self._conn.execute(

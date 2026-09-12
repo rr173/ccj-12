@@ -61,7 +61,9 @@ from .config import Settings
 from .db import Database
 from . import delegation as delegation_mod
 from .handlers import business_handler
-from .replay_policy import ROLE_ANY, match_rule, resolve_rules
+from .replay_policy import ROLE_ANY, match_rule
+from .replay_rollout import batch_routing_key, record_batch_route_audit, \
+    resolve_route, route_snapshot
 
 log = logging.getLogger("gateway.replay")
 
@@ -329,7 +331,8 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
     if high_risk and not approval_note:
         raise HTTPException(422, "approval_note is required for high risk batches")
 
-    # 提交幂等：同一 request_id 重复提交（网络重试/双击）返回原批次
+    # 提交幂等：同一 request_id 重复提交（网络重试/双击）返回原批次——
+    # 连同当时的分流命中一起回显，保证重复提交看到的版本归属始终一致
     if req.request_id:
         existing = db.query_one(
             "SELECT * FROM replay_batches WHERE request_id=?", (req.request_id,))
@@ -337,7 +340,11 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
             return 200, {"result": "duplicate", "batch_id": existing["id"],
                          "total": existing["total"],
                          "status": existing["status"],
-                         "approval_status": existing["approval_status"]}
+                         "approval_status": existing["approval_status"],
+                         "policy_version": existing["policy_version"],
+                         "policy_lane": existing["policy_lane"],
+                         "rollout_id": existing["rollout_id"],
+                         "rollout_seq": existing["rollout_seq"]}
 
     rows = _select_deliveries(db, req)
     active = _active_replay_by_delivery(db)
@@ -358,56 +365,74 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
 
     now = time.time()
     total = len(eligible)
-    # 按当前生效策略（无已生效版本时为内置默认策略）解析本批的审批节点链：
-    # 规则按风险等级与批次规模匹配，节点串行或并行；解析结果作为快照随批次
-    # 落盘，之后策略更新不影响本批。已生效策略下高风险批次无规则匹配时
-    # 拒绝提交（fail closed，不静默降低审批要求）。
-    policy_version, rules = resolve_rules(db, approval_timeout)
-    rule = match_rule(rules, req.risk_level, total)
-    if rule is None:
-        if high_risk:
-            return 422, {"error": "no_applicable_policy",
-                         "detail": "no approval policy rule matches this batch; "
-                                   "ask a policy maintainer to cover it",
-                         "risk_level": req.risk_level, "total": total}
-        node_specs, mode, rule_name = [], "serial", None
-    else:
-        node_specs, mode, rule_name = rule["nodes"], rule["mode"], rule["name"]
+    # 分流键（同 request_id / 同内容集合的提交恒定）在写事务之前确定；版本解析放进
+    # 写事务，与灰度发布/暂停/回滚/整份切换串行：批次解析到的版本与落盘快照必然来自
+    # 同一份发布状态，不会出现无版本或跨版本快照。
+    delivery_ids = [d["id"] for d in eligible]
+    routing_key = batch_routing_key(req.request_id, delivery_ids)
 
-    if node_specs:
-        batch_status = BATCH_PENDING_APPROVAL
-        approval_status = APPROVAL_PENDING
-        # 批次截止时间 = 活动节点中最早的截止（串行：首节点；并行：全体同时激活取最小）
-        first_timeouts = ([node_specs[0]["timeout_seconds"]] if mode == "serial"
-                          else [n["timeout_seconds"] for n in node_specs])
-        deadline = now + min(first_timeouts)
-    else:
-        batch_status = BATCH_RUNNING
-        approval_status = APPROVAL_NOT_REQUIRED
-        deadline = None
-    snapshot = {"policy_version": policy_version, "rule_name": rule_name, "mode": mode,
-                "risk_level": req.risk_level, "batch_size": total,
-                "nodes": [{"seq": i, "role": n["role"],
-                           "allowed_roles": node_allowed_roles(n),
-                           "required_approvals": node_required(n),
-                           "timeout_seconds": n["timeout_seconds"]}
-                          for i, n in enumerate(node_specs)]}
     filters = req.model_dump(exclude={"operator", "reason", "request_id", "max_concurrency",
                                       "risk_level", "approval_note"})
     filters_json = json.dumps(filters, ensure_ascii=False, default=str)
+    # 解析结果由写事务内部填充（route/rule/...），供事务返回后组装响应
+    routed: dict = {}
     try:
         with db.tx() as cur:
+            # 按灰度发布状态选版本：命中开放中候选的规模闸门与百分比桶 -> 候选版本，
+            # 否则走该风险等级的稳定版本（无稳定指针 -> 内置默认策略）。
+            route = resolve_route(cur, req.risk_level, total, routing_key, approval_timeout)
+            rule = match_rule(route["rules"], req.risk_level, total)
+            if rule is None:
+                # 与灰度无关的提交校验：事务内不产生任何写入，直接返回
+                if high_risk:
+                    return 422, {"error": "no_applicable_policy",
+                                 "detail": "no approval policy rule matches this batch; "
+                                           "ask a policy maintainer to cover it",
+                                 "risk_level": req.risk_level, "total": total,
+                                 "policy_version": route["policy_version"],
+                                 "lane": route["lane"]}
+                node_specs, mode, rule_name = [], "serial", None
+            else:
+                node_specs, mode, rule_name = rule["nodes"], rule["mode"], rule["name"]
+            policy_version = route["policy_version"]
+            routed.update(route=route, rule_name=rule_name, mode=mode,
+                          node_specs=node_specs)
+
+            if node_specs:
+                batch_status = BATCH_PENDING_APPROVAL
+                approval_status = APPROVAL_PENDING
+                # 批次截止时间 = 活动节点中最早的截止（串行：首节点；并行：全体同时激活取最小）
+                first_timeouts = ([node_specs[0]["timeout_seconds"]] if mode == "serial"
+                                  else [n["timeout_seconds"] for n in node_specs])
+                deadline = now + min(first_timeouts)
+            else:
+                batch_status = BATCH_RUNNING
+                approval_status = APPROVAL_NOT_REQUIRED
+                deadline = None
+            routed.update(batch_status=batch_status, approval_status=approval_status,
+                          deadline=deadline)
+            snap_route = route_snapshot(route, req.risk_level, total, rule_name, mode)
+            snapshot = {"policy_version": policy_version, "rule_name": rule_name,
+                        "mode": mode, "risk_level": req.risk_level, "batch_size": total,
+                        "routing": snap_route,
+                        "nodes": [{"seq": i, "role": n["role"],
+                                   "allowed_roles": node_allowed_roles(n),
+                                   "required_approvals": node_required(n),
+                                   "timeout_seconds": n["timeout_seconds"]}
+                                  for i, n in enumerate(node_specs)]}
             cur.execute(
                 """INSERT INTO replay_batches
                    (request_id, operator, reason, status, filters, max_concurrency,
                     risk_level, approval_note, approval_status, approval_deadline,
-                    policy_version, policy_snapshot,
-                    total, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    policy_version, policy_snapshot, policy_lane, rollout_id,
+                    rollout_seq, total, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (req.request_id, operator, req.reason, batch_status, filters_json,
                  req.max_concurrency, req.risk_level,
                  approval_note or None, approval_status, deadline,
-                 policy_version, json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                 policy_version,
+                 json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                 route["lane"], route["release_id"], route["rollout_seq"],
                  len(eligible), now, now),
             )
             batch_id = cur.lastrowid
@@ -450,9 +475,15 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
                 "status": batch_status, "approval_status": approval_status,
                 "approval_deadline": deadline,
                 "policy_version": policy_version, "rule_name": rule_name,
+                "policy_lane": route["lane"], "rollout_id": route["release_id"],
+                "rollout_seq": route["rollout_seq"],
                 "approval_mode": mode if node_specs else None,
                 "approval_nodes": len(node_specs),
                 "filters": filters, "total": len(eligible), "skipped": skipped}, ts=now)
+            # 分流命中单独一条审计（车道/发布单/闸门/桶），与批次同事务：发布单与批次
+            # 两侧轨迹可互相核对，回滚后新批次与旧批次的版本归属一目了然
+            record_batch_route_audit(cur, batch_id, req.risk_level, route,
+                                     rule_name, now)
     except sqlite3.IntegrityError:
         # 并发下 request_id 撞唯一键：返回已存在的那一批
         if req.request_id:
@@ -462,14 +493,31 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
                 return 200, {"result": "duplicate", "batch_id": existing["id"],
                              "total": existing["total"],
                              "status": existing["status"],
-                             "approval_status": existing["approval_status"]}
+                             "approval_status": existing["approval_status"],
+                             "policy_version": existing["policy_version"],
+                             "policy_lane": existing["policy_lane"],
+                             "rollout_id": existing["rollout_id"],
+                             "rollout_seq": existing["rollout_seq"]}
         raise
 
+    route = routed["route"]
+    rule_name = routed["rule_name"]
+    node_specs = routed["node_specs"]
+    batch_status = routed["batch_status"]
+    approval_status = routed["approval_status"]
+    deadline = routed["deadline"]
     body = {"result": "created", "batch_id": batch_id,
             "total": len(eligible), "skipped": skipped,
             "status": batch_status, "risk_level": req.risk_level,
             "approval_status": approval_status,
             "policy_version": policy_version,
+            "policy_lane": route["lane"],
+            "rollout_id": route["release_id"],
+            "rollout_seq": route["rollout_seq"],
+            "candidate_version": (route["release"]["candidate_version"]
+                                  if route["release"] else None),
+            "routing_bucket": route["bucket"],
+            "rule_name": rule_name,
             "approval_nodes": len(node_specs)}
     if deadline is not None:
         body["approval_deadline"] = deadline
@@ -1205,6 +1253,12 @@ def _approval_view(db: Database, row, now: float | None = None) -> dict:
             and row["approval_deadline"] is not None
             and row["approval_deadline"] <= now),
         "policy_version": row["policy_version"],
+        # 分流命中（提交时固化）：稳定/候选车道、灰度发布单、发布批次、分流规则
+        "policy_lane": row["policy_lane"],
+        "rollout_id": row["rollout_id"],
+        "rollout_seq": row["rollout_seq"],
+        "policy_routing": (snapshot.get("routing") if (snapshot := _snapshot_json(row))
+                           else None),
         "nodes": node_views,
         # 当前待决节点 / 剩余节点（待决 + 尚未轮到的串行节点）
         "current_node_ids": [n["id"] for n in nodes if n["status"] == NODE_ACTIVE],
@@ -1221,6 +1275,10 @@ def _batch_view(row) -> dict:
     out["policy_snapshot"] = (json.loads(out["policy_snapshot"])
                               if out["policy_snapshot"] else None)
     return out
+
+
+def _snapshot_json(row) -> dict | None:
+    return json.loads(row["policy_snapshot"]) if row["policy_snapshot"] else None
 
 
 def batch_detail(db: Database, batch_id: int) -> dict:
