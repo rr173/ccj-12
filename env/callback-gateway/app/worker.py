@@ -142,7 +142,9 @@ class Worker:
     # 冲突冻结期间整组暂停派发；人工选定后未选中版本被 superseded/cancelled，
     # 其滞留的副作用永不再发 —— 只有被选中的版本继续执行。
     # 重放产生的副作用（replay_task_id 非空）走同一条幂等派发链路：
-    # 任务完成且批次未暂停/取消才放行，暂停期间滞留，取消时已被置 cancelled。
+    # 任务完成且批次确实在执行（running/completed/completed_with_failures）才放行；
+    # 暂停期间滞留，待审批/被拒绝/被取消（含审批超时）的批次永不放行
+    # （拒绝/超时时尚无副作用产生，取消时已有的滞留行已置 cancelled）。
     _DISPATCHABLE_SQL = """
         SELECT o.*, t.batch_id AS replay_batch_id FROM outbox o
         JOIN deliveries d ON d.id = o.delivery_id
@@ -151,7 +153,7 @@ class Worker:
         WHERE o.status='pending' AND (
             (o.replay_task_id IS NULL AND d.frozen=0 AND d.status='done')
             OR (o.replay_task_id IS NOT NULL AND t.status='done'
-                AND b.status NOT IN ('paused','cancelled'))
+                AND b.status IN ('running','completed','completed_with_failures'))
         )
         ORDER BY o.id LIMIT 100"""
 
@@ -164,7 +166,7 @@ class Worker:
         now = self.clock()
         key = row["idempotency_key"]
         # 发送前复查：拉取之后行可能已被人工处置取消，或所属版本被冻结/取代，
-        # 或所属重放批次被暂停/取消
+        # 或所属重放批次被暂停/取消/拒绝/仍在等待审批
         still_valid = self.db.query_one(
             """SELECT 1 AS x FROM outbox o
                JOIN deliveries d ON d.id = o.delivery_id
@@ -173,7 +175,7 @@ class Worker:
                WHERE o.id=? AND o.status='pending' AND (
                    (o.replay_task_id IS NULL AND d.frozen=0 AND d.status='done')
                    OR (o.replay_task_id IS NOT NULL AND t.status='done'
-                       AND b.status NOT IN ('paused','cancelled'))
+                       AND b.status IN ('running','completed','completed_with_failures'))
                )""",
             (row["id"],),
         )

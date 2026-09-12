@@ -42,6 +42,9 @@
 | 每条重放记录发起人、原始版本、原因、进度 | `replay_tasks` 逐条冗余 operator/reason/delivery_id，状态机 + attempts + checkpoint 即进度 |
 | 同一份内容重复加入不生成第二个重放任务 | 批内 `UNIQUE(batch_id, delivery_id)`；`request_id` 重复提交返回原批次；跨批存在活动任务的投递自动跳过 |
 | 重放可暂停/继续/取消 | `POST /admin/replays/{id}/pause|resume|cancel`；取消时未执行任务与滞留副作用同事务取消 |
+| 高风险批次须他人审批后才能执行 | 提交带 `risk_level=high` + `approval_note`：批次落 `pending_approval`，worker 不领取；`POST .../approve`（审批人必须不同于发起人）放行，`POST .../reject`（必填原因）整体取消；超时由 worker 自动释放，见 `app/replay.py` |
+| 审批结果/拒绝原因/超时释放/批准后执行全部可审计 | `replay_batch_approved` / `replay_batch_rejected`（含 reason）/ `replay_batch_approval_expired` + 既有执行事件；批次详情含 `approval`（状态、发起人、审批人、批准时间、拒绝原因、截止时间） |
+| 重复提交或重复批准不会执行两次 | `request_id` 重复提交返回原批次；批准/拒绝/超时/取消都是带状态守卫的条件更新，重复决定返回 409，不产生第二套任务与事件 |
 | 批次级并发配额 | 提交时 `max_concurrency` 指定整批最多同时处理多少条；占用=本批 `processing` 任务数，领取时在占位事务里实时推导复核，见 `app/replay.py` |
 | 同一编号多条历史版本按 created_at 先后执行 | 任务落盘快照 `delivery_created_at` 作排序键；前序未进终态（done/failed/cancelled）时条件更新拒绝领取后一条 |
 | 批次详情显示占用/等待/每条阻塞原因 | `GET /admin/replays/{id}`：`in_flight`（当前占用）、`waiting`（等待数量）、每条任务的 `blocked_reason`（实时计算） |
@@ -64,7 +67,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 61 个端到端测试
+python -m pytest tests/          # 78 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -169,10 +172,37 @@ curl -X POST localhost:8000/admin/replays \
   -d '{"external_id": "A-1001", "status": "done",
        "operator": "ops-li", "reason": "下游丢数据需补发", "request_id": "req-20260912-01",
        "max_concurrency": 2}'
-# -> {"result": "created", "batch_id": 1, "total": 1, "skipped": []}
+# -> {"result": "created", "batch_id": 1, "total": 1, "skipped": [],
+#     "status": "running", "risk_level": "normal", "approval_status": "not_required"}
+
+# 2b) 高风险批次：标记 risk_level=high 并填写审批说明 approval_note。
+#     批次落为 pending_approval（任务照常占住对应内容，但 worker 一律不领取），
+#     必须由不同于发起人的运营人员明确批准后才进入 running。
+curl -X POST localhost:8000/admin/replays \
+  -H 'Content-Type: application/json' \
+  -d '{"delivery_ids": [12, 13], "operator": "ops-li", "reason": "资金类回调补发",
+       "risk_level": "high", "approval_note": "涉及 2 笔退款回调，已与下游核对窗口"}'
+# -> {"result": "created", "batch_id": 2, "total": 2,
+#     "status": "pending_approval", "approval_status": "pending",
+#     "approval_deadline": 1757760000.0}
+
+# 另一个运营人员（不能是发起人 ops-li）批准 / 拒绝（拒绝必须带原因）
+curl -X POST localhost:8000/admin/replays/2/approve \
+  -H 'Content-Type: application/json' \
+  -d '{"operator": "ops-wang", "note": "已电话核实，可以放行"}'
+# -> {"result": "approved", "batch_id": 2, "status": "running"}
+curl -X POST localhost:8000/admin/replays/2/reject \
+  -H 'Content-Type: application/json' \
+  -d '{"operator": "ops-wang", "reason": "影响面评估不通过", "note": "等下游就绪窗口"}'
+# -> {"result": "rejected", "batch_id": 2, "cancelled_tasks": 2}
+
+# 超过 approval_deadline 仍无人决定：replay worker 下一轮自动释放——
+# 批次置 cancelled、approval_status=expired、未执行任务整体取消（审计可查）。
+# 发起人也可以在待决期间主动 cancel 撤回。
 
 # 3) 跟踪进度 / 控制执行
 #    批次详情：进度计数 + max_concurrency + in_flight（当前占用）+ waiting（等待数量）
+#    + approval（风险等级、审批状态、发起人、审批人、批准时间、拒绝原因、截止时间）
 #    + 每条任务状态与 blocked_reason（被阻塞的原因，可执行为 null）
 curl localhost:8000/admin/replays/1
 curl -X POST localhost:8000/admin/replays/1/pause  -H 'Content-Type: application/json' -d '{"operator": "ops-li"}'
@@ -199,15 +229,26 @@ curl 'localhost:8000/admin/replays/1/events?task_id=3'
   未进终态（done/failed/cancelled）时后一条不能被 worker 领取。前序失败退避
   期间后一条等待；前序终态失败/被取消后后一条放行，不会死锁。
 - **被阻塞任务的状态与审计**：批次详情里每条 pending 任务带实时 `blocked_reason`
-  —— `batch_paused` / `retry_backoff` / `waiting_predecessor:{task_id}` /
+  —— `awaiting_approval`（高风险待审批）/ `batch_rejected`（已拒绝）/
+  `batch_paused` / `retry_backoff` / `waiting_predecessor:{task_id}` /
   `quota_exhausted:{占用}/{上限}`；worker 每轮复核领取闸门，原因变化时写
   `replay_task_blocked` 审计事件（不变不重复写），与失败重试、取消的既有事件
   一样可按批次/任务查询。
 - 重放副作用与正常处理**走同一条 outbox 幂等链路**：幂等键以 `replay:{task_id}`
   为作用域——同一任务重试、服务重启都不会重复派发，下游仍按幂等键去重；
   新批次的重放才会有意再次产生外部效果。
-- 批次状态机：`running → paused → running → completed / completed_with_failures`，
-  `cancelled` 为终态；全部任务到终态后批次自动收尾。
+- 批次状态机：普通批次 `running → paused → running → completed /
+  completed_with_failures`；高风险批次先到 `pending_approval`——非发起人
+  `approve` 后进入 `running`，`reject`（或发起人撤回）进 `rejected`/`cancelled`，
+  超过 `REPLAY_APPROVAL_TIMEOUT_SECONDS` 未决由 worker 自动释放为 `cancelled`
+  （`approval_status=expired`）；`rejected`/`cancelled` 为终态；全部任务到终态后
+  批次自动收尾。
+- **高风险审批的防绕过与幂等**：待审批期间任务以 `pending` 占住对应内容，
+  跨批的「活动重放」检查会阻止另开一批重放同一投递；worker 领取查询与占位
+  事务双重要求批次 `running` 且审批状态为 `approved`/`not_required`；outbox
+  派发同样只放行 `running/completed/completed_with_failures` 批次。批准、拒绝、
+  超时、取消全部是带状态守卫的条件更新，重复提交（`request_id`）或重复批准/拒绝
+  只会返回原批次或 `409`，不会产生第二套任务、第二份副作用或第二条决定事件。
 
 
 ## 配置（环境变量）
@@ -221,6 +262,7 @@ curl 'localhost:8000/admin/replays/1/events?task_id=3'
 | `MAX_ATTEMPTS` | `5` | 连续失败上限，超过进隔离队列 |
 | `WORKER_POLL_INTERVAL` | `1` | worker 轮询间隔（秒） |
 | `SIGNATURE_TOLERANCE_SECONDS` | `300` | 签名时间戳容差（防重放） |
+| `REPLAY_APPROVAL_TIMEOUT_SECONDS` | `3600` | 高风险重放批次审批超时；提交后超时仍未由他人批准/拒绝，worker 自动释放（取消）批次 |
 | `RUN_WORKER` | `true` | 是否在本进程跑后台 worker |
 
 ## 设计要点
@@ -235,13 +277,16 @@ curl 'localhost:8000/admin/replays/1/events?task_id=3'
   人工选定后，未选中版本滞留在 outbox 的副作用在同一事务里置为 `cancelled`
   （内容保留可查），派发器只放行「done 且未冻结」版本——旧版本不会再对外产生效果。
 - **隔离不蔓延**：隔离是 per-delivery 的状态，worker 拉取时天然跳过，其他编号照常处理。
-- **重放即审计**：重放的每个动作（创建/暂停/继续/取消/执行/被配额或顺序挡下/
-  失败/人工重试）都写 `events` 并带 `replay_batch_id`/`replay_task_id`，一批重放
-  的完整轨迹一次查全；重放任务只引用落盘原文（delivery_id），不复制内容，
-  原始版本永不改写。
+- **重放即审计**：重放的每个动作（创建/审批通过/拒绝/超时释放/撤回/暂停/继续/取消/
+  执行/被配额或顺序挡下/失败/人工重试）都写 `events` 并带
+  `replay_batch_id`/`replay_task_id`，一批重放的完整轨迹一次查全；重放任务只引用
+  落盘原文（delivery_id），不复制内容，原始版本永不改写。
 - **并发配额实时推导**：批次占用量 = 该批 `processing` 任务数，领取与复核在同一
   写事务里完成（SQLite 写事务串行，多副本也不会超领）；不维护任何计数器，
   因此暂停/取消/崩溃重启都不存在「忘了释放」的路径。
 - **老库就地升级**：首次以新版本打开旧库时自动给 `outbox` 补 `replay_task_id` 列、
   给 `replay_batches`/`replay_tasks` 补 `max_concurrency`/`delivery_created_at`/
-  `blocked_reason` 列（存量任务的排序键从 deliveries 回填），无需手工迁移。
+  `blocked_reason` 列（存量任务的排序键从 deliveries 回填），给 `replay_batches`
+  补 `risk_level`/`approval_note`/`approval_status`/`approver`/`approval_reason`/
+  `approved_at`/`approval_deadline` 列（存量批次视为普通风险、无需审批，状态不变），
+  无需手工迁移。

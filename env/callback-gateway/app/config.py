@@ -20,6 +20,8 @@ class Settings:
     worker_poll_interval: float = 1.0
     # 签名时间戳容差（秒），防重放
     signature_tolerance_seconds: int = 300
+    # 高风险重放批次的审批超时（秒）：提交后超时仍未由他人批准，自动释放（取消）批次
+    replay_approval_timeout_seconds: float = 3600.0
     # 是否随服务启动后台 worker（测试时可关闭，手动驱动）
     run_worker: bool = True
 
@@ -35,5 +37,7 @@ class Settings:
             signature_tolerance_seconds=int(
                 os.environ.get("SIGNATURE_TOLERANCE_SECONDS", cls.signature_tolerance_seconds)
             ),
+            replay_approval_timeout_seconds=float(os.environ.get(
+                "REPLAY_APPROVAL_TIMEOUT_SECONDS", cls.replay_approval_timeout_seconds)),
             run_worker=os.environ.get("RUN_WORKER", "true").lower() == "true",
         )

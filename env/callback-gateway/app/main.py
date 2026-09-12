@@ -4,7 +4,8 @@
 - 接入（本文件 POST /callbacks）：验签 -> 落盘 -> 确认，不做任何业务处理；
 - 处理（worker.py 后台任务）：重试、隔离、副作用派发；
 - 人工处置（admin.py）：冲突比较/选定、隔离重投、审计查询；
-- 业务重放（replay.py）：筛选预览 -> 批量提交 -> 暂停/继续/取消 -> 审计查询。
+- 业务重放（replay.py）：筛选预览 -> 批量提交 -> 高风险审批（他人批准/拒绝/超时释放）
+  -> 暂停/继续/取消 -> 审计查询。
 """
 from __future__ import annotations
 
@@ -88,7 +89,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok", "time": time.time()}
 
     app.include_router(create_admin_router(db, keys))
-    app.include_router(create_replay_router(db))
+    app.include_router(create_replay_router(db, settings))
     return app
 
 

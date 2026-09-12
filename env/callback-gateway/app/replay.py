@@ -1,12 +1,20 @@
 """业务重放模块：可追溯的历史回调重放。
 
-流程：筛选预览（preview）-> 提交批次（submit）-> 后台重放 worker 逐条执行 ->
-副作用走与正常处理完全相同的 outbox 幂等派发链路。
+流程：筛选预览（preview）-> 提交批次（submit）-> [高风险须审批] ->
+后台重放 worker 逐条执行 -> 副作用走与正常处理完全相同的 outbox 幂等派发链路。
 
 - 每条重放任务记录发起人、原始版本（delivery_id）、原因和进度（状态/次数/checkpoint）；
 - 同一份内容不会生成第二个重放任务：批内 UNIQUE(batch_id, delivery_id) 去重；
-  提交带 request_id 时重复提交返回原批次；跨批存在活动任务（pending/processing）
-  的投递会被跳过（已完成的批次不阻塞以后再次重放——那是有意为之的新批次）；
+  提交带 request_id 时重复提交返回原批次；跨批存在活动任务（pending/processing，
+  含待审批批次占住的任务）的投递会被跳过（已完成的批次不阻塞以后再次重放
+  ——那是有意为之的新批次）；
+- 高风险审批：提交时可用 risk_level=high（并填 approval_note）标记高风险批次，
+  批次进入 pending_approval 而不是 running，worker 在批准前不能领取其任何任务
+  （跨批活动检查同时占住对应内容，防止绕过审批另开一批）；批准必须由不同于
+  发起人的运营人员显式做出（POST .../approve），批准后批次才进入 running；
+  拒绝（POST .../reject，必填拒绝原因）或超时（approval_deadline 到期由 worker
+  扫描释放）把未执行任务整体置为终态 cancelled。批准/拒绝都是条件状态转移，
+  重复批准/拒绝不会产生第二次效果；request_id 重复提交也不会产生第二次执行；
 - 批次级并发配额：提交时可指定 max_concurrency（整个批次最多同时处理多少条），
   占用量 = 本批 processing 中的任务数，领取时在占位事务里实时推导——任务离开
   processing（完成/失败/取消/重启回收）槽位即释放，不存在需要单独回收的计数器，
@@ -79,11 +87,47 @@ class SubmitRequest(ReplayFilter):
     request_id: str | None = None  # 提交幂等键：重复提交返回原批次
     # 批次级并发配额：整个批次最多同时处理多少条任务；NULL 表示不限
     max_concurrency: int | None = Field(default=None, ge=1)
+    # 风险等级：high 为高风险，必须由非发起人批准后才能进入 running；normal 直接运行
+    risk_level: str = "normal"
+    # 审批说明：高风险批次必填（为什么要做这次高风险重放，供审批人判断与事后追溯）
+    approval_note: str | None = None
 
 
 class BatchActionRequest(BaseModel):
     operator: str
     note: str = ""
+
+
+class ApprovalRequest(BaseModel):
+    """高风险批次的批准/拒绝请求：审批人必须是不同于发起人的运营人员。"""
+    operator: str                  # 审批人（必填，须不同于批次发起人）
+    note: str = ""                 # 批准备注（可选）
+
+
+class RejectionRequest(BaseModel):
+    operator: str                  # 审批人（必填，须不同于批次发起人）
+    reason: str                    # 拒绝原因（必填，落批次与审计）
+    note: str = ""
+
+
+# 批次/审批状态
+BATCH_RUNNING = "running"
+BATCH_PAUSED = "paused"
+BATCH_PENDING_APPROVAL = "pending_approval"
+BATCH_REJECTED = "rejected"
+BATCH_CANCELLED = "cancelled"
+RISK_LEVELS = ("normal", "high")
+APPROVAL_NOT_REQUIRED = "not_required"
+APPROVAL_PENDING = "pending"
+APPROVAL_APPROVED = "approved"
+APPROVAL_REJECTED = "rejected"
+APPROVAL_EXPIRED = "expired"
+
+
+def _require_operator(operator: str, field: str = "operator"):
+    if not operator or not operator.strip():
+        raise HTTPException(422, f"{field} must be non-empty")
+    return operator.strip()
 
 
 def _parse_time(value) -> float | None:
@@ -188,12 +232,22 @@ def preview(db: Database, req: PreviewRequest) -> dict:
 
 # ---- 提交批次 --------------------------------------------------------------
 
-def submit(db: Database, req: SubmitRequest) -> tuple[int, dict]:
-    """一次性提交一批重放任务：批次 + 全部任务在一个事务里落盘。"""
-    if not req.operator.strip():
-        raise HTTPException(422, "operator must be non-empty")
+def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[int, dict]:
+    """一次性提交一批重放任务：批次 + 全部任务在一个事务里落盘。
+
+    高风险批次（risk_level=high）落为 pending_approval：任务照常落盘并占住对应
+    内容（其他批次不能再提交同一投递），但 worker 在非发起人明确批准前不领取。
+    """
+    operator = _require_operator(req.operator)
     if not req.reason.strip():
         raise HTTPException(422, "reason must be non-empty")
+    if req.risk_level not in RISK_LEVELS:
+        raise HTTPException(422, f"invalid risk_level: {req.risk_level!r} "
+                                 f"(expect one of {','.join(RISK_LEVELS)})")
+    approval_note = (req.approval_note or "").strip()
+    high_risk = req.risk_level == "high"
+    if high_risk and not approval_note:
+        raise HTTPException(422, "approval_note is required for high risk batches")
 
     # 提交幂等：同一 request_id 重复提交（网络重试/双击）返回原批次
     if req.request_id:
@@ -201,7 +255,9 @@ def submit(db: Database, req: SubmitRequest) -> tuple[int, dict]:
             "SELECT * FROM replay_batches WHERE request_id=?", (req.request_id,))
         if existing is not None:
             return 200, {"result": "duplicate", "batch_id": existing["id"],
-                         "total": existing["total"]}
+                         "total": existing["total"],
+                         "status": existing["status"],
+                         "approval_status": existing["approval_status"]}
 
     rows = _select_deliveries(db, req)
     active = _active_replay_by_delivery(db)
@@ -221,17 +277,29 @@ def submit(db: Database, req: SubmitRequest) -> tuple[int, dict]:
                      "matched": len(rows), "skipped": skipped}
 
     now = time.time()
-    filters = req.model_dump(exclude={"operator", "reason", "request_id", "max_concurrency"})
+    if high_risk:
+        batch_status = BATCH_PENDING_APPROVAL
+        approval_status = APPROVAL_PENDING
+        deadline = now + approval_timeout
+    else:
+        batch_status = BATCH_RUNNING
+        approval_status = APPROVAL_NOT_REQUIRED
+        deadline = None
+    filters = req.model_dump(exclude={"operator", "reason", "request_id", "max_concurrency",
+                                      "risk_level", "approval_note"})
     filters_json = json.dumps(filters, ensure_ascii=False, default=str)
     try:
         with db.tx() as cur:
             cur.execute(
                 """INSERT INTO replay_batches
                    (request_id, operator, reason, status, filters, max_concurrency,
+                    risk_level, approval_note, approval_status, approval_deadline,
                     total, created_at, updated_at)
-                   VALUES (?,?,?,'running',?,?,?,?,?)""",
-                (req.request_id, req.operator, req.reason, filters_json,
-                 req.max_concurrency, len(eligible), now, now),
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (req.request_id, operator, req.reason, batch_status, filters_json,
+                 req.max_concurrency, req.risk_level,
+                 approval_note or None, approval_status, deadline,
+                 len(eligible), now, now),
             )
             batch_id = cur.lastrowid
             for d in eligible:
@@ -243,13 +311,16 @@ def submit(db: Database, req: SubmitRequest) -> tuple[int, dict]:
                        (batch_id, delivery_id, external_id, operator, reason,
                         status, delivery_created_at, created_at, updated_at)
                        VALUES (?,?,?,?,?,'pending',?,?,?)""",
-                    (batch_id, d["id"], d["external_id"], req.operator, req.reason,
+                    (batch_id, d["id"], d["external_id"], operator, req.reason,
                      d["created_at"], now, now),
                 )
             audit.record(cur, "replay_batch_created", None, None, {
-                "replay_batch_id": batch_id, "operator": req.operator,
+                "replay_batch_id": batch_id, "operator": operator,
                 "reason": req.reason, "request_id": req.request_id,
                 "max_concurrency": req.max_concurrency,
+                "risk_level": req.risk_level, "approval_note": approval_note or None,
+                "status": batch_status, "approval_status": approval_status,
+                "approval_deadline": deadline,
                 "filters": filters, "total": len(eligible), "skipped": skipped}, ts=now)
     except sqlite3.IntegrityError:
         # 并发下 request_id 撞唯一键：返回已存在的那一批
@@ -258,11 +329,18 @@ def submit(db: Database, req: SubmitRequest) -> tuple[int, dict]:
                 "SELECT * FROM replay_batches WHERE request_id=?", (req.request_id,))
             if existing is not None:
                 return 200, {"result": "duplicate", "batch_id": existing["id"],
-                             "total": existing["total"]}
+                             "total": existing["total"],
+                             "status": existing["status"],
+                             "approval_status": existing["approval_status"]}
         raise
 
-    return 201, {"result": "created", "batch_id": batch_id,
-                 "total": len(eligible), "skipped": skipped}
+    body = {"result": "created", "batch_id": batch_id,
+            "total": len(eligible), "skipped": skipped,
+            "status": batch_status, "risk_level": req.risk_level,
+            "approval_status": approval_status}
+    if deadline is not None:
+        body["approval_deadline"] = deadline
+    return 201, body
 
 
 # ---- 批次控制：暂停 / 继续 / 取消 --------------------------------------------
@@ -272,6 +350,132 @@ def _get_batch_or_404(db: Database, batch_id: int):
     if row is None:
         raise HTTPException(404, "replay batch not found")
     return row
+
+
+# ---- 高风险审批：批准 / 拒绝 / 超时释放 ---------------------------------------
+
+def _approval_guard(batch, operator: str) -> None:
+    """审批操作的共同前置：批次仍待决，且审批人不是发起人本人（职责分离）。"""
+    if batch["approval_status"] != APPROVAL_PENDING \
+            or batch["status"] != BATCH_PENDING_APPROVAL:
+        raise HTTPException(
+            409, f"batch approval is {batch['approval_status']}, "
+                 f"batch is {batch['status']}, decision no longer accepted")
+    if operator == batch["operator"]:
+        raise HTTPException(403, "approver must be different from the batch operator")
+
+
+def approve(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
+    """批准高风险批次：审批人须不同于发起人；批准后批次进入 running，worker 方可领取。
+
+    条件更新（仅在仍为 pending_approval 时生效）保证重复/并发批准最多放行一次，
+    不会产生第二次执行。
+    """
+    operator = _require_operator(operator, "operator")
+    now = time.time()
+    with db.tx() as cur:
+        batch = _get_batch_or_404(db, batch_id)
+        _approval_guard(batch, operator)
+        changed = cur.execute(
+            """UPDATE replay_batches
+               SET status='running', approval_status='approved', approver=?,
+                   approved_at=?, approval_reason=NULL, updated_at=?
+               WHERE id=? AND status='pending_approval'
+                 AND approval_status='pending'""",
+            (operator, now, now, batch_id),
+        ).rowcount
+        if not changed:  # 并发下已被另一笔审批决定（拒绝/超时/取消）
+            raise HTTPException(409, "batch is no longer awaiting approval")
+        audit.record(cur, "replay_batch_approved", None, None,
+                     {"replay_batch_id": batch_id, "operator": operator,
+                      "submitted_by": batch["operator"], "note": note.strip(),
+                      "risk_level": batch["risk_level"]}, ts=now)
+    return {"result": "approved", "batch_id": batch_id, "status": BATCH_RUNNING}
+
+
+def reject(db: Database, batch_id: int, operator: str, reason: str,
+           note: str = "") -> dict:
+    """拒绝高风险批次：拒绝原因必填；未执行的任务整体置为终态 cancelled，
+    占住的投递随之释放（之后可以重新提交新批次）。拒绝不可撤销。"""
+    operator = _require_operator(operator, "operator")
+    reason = (reason or "").strip()
+    if not reason:
+        raise HTTPException(422, "reason must be non-empty when rejecting")
+    now = time.time()
+    with db.tx() as cur:
+        batch = _get_batch_or_404(db, batch_id)
+        _approval_guard(batch, operator)
+        changed = cur.execute(
+            """UPDATE replay_batches
+               SET status='rejected', approval_status='rejected', approver=?,
+                   approval_reason=?, approved_at=NULL, updated_at=?, finished_at=?
+               WHERE id=? AND status='pending_approval'
+                 AND approval_status='pending'""",
+            (operator, reason, now, now, batch_id),
+        ).rowcount
+        if not changed:
+            raise HTTPException(409, "batch is no longer awaiting approval")
+        cancelled_tasks = cur.execute(
+            """UPDATE replay_tasks SET status='cancelled', blocked_reason=NULL,
+               finished_at=?, updated_at=?
+               WHERE batch_id=? AND status IN ('pending','processing')""",
+            (now, now, batch_id),
+        ).rowcount
+        cur.execute(
+            "UPDATE replay_batches SET cancelled=cancelled+?, updated_at=? WHERE id=?",
+            (cancelled_tasks, now, batch_id),
+        )
+        audit.record(cur, "replay_batch_rejected", None, None,
+                     {"replay_batch_id": batch_id, "operator": operator,
+                      "submitted_by": batch["operator"], "reason": reason,
+                      "note": note.strip(), "risk_level": batch["risk_level"],
+                      "cancelled_tasks": cancelled_tasks}, ts=now)
+    return {"result": "rejected", "batch_id": batch_id,
+            "cancelled_tasks": cancelled_tasks}
+
+
+def expire_approvals(db: Database, now: float) -> int:
+    """审批超时释放：超过 approval_deadline 仍待决的高风险批次整体取消。
+
+    由 replay worker 每轮在领取任务前调用（也因此可被手动 run_once 触发）。
+    条件更新保证与人工批准/拒绝互斥：谁先提交谁生效，超时不会作用到已批准的
+    批次上；重复扫描不会产生第二次效果。
+    """
+    due = db.query(
+        """SELECT * FROM replay_batches
+           WHERE status='pending_approval' AND approval_status='pending'
+             AND approval_deadline IS NOT NULL AND approval_deadline <= ?""",
+        (now,),
+    )
+    for batch in due:
+        with db.tx() as cur:
+            changed = cur.execute(
+                """UPDATE replay_batches
+                   SET status='cancelled', approval_status='expired',
+                       updated_at=?, finished_at=?
+                   WHERE id=? AND status='pending_approval'
+                     AND approval_status='pending'""",
+                (now, now, batch["id"]),
+            ).rowcount
+            if not changed:  # 并发下已被人工批准/拒绝/取消
+                continue
+            cancelled_tasks = cur.execute(
+                """UPDATE replay_tasks SET status='cancelled', blocked_reason=NULL,
+                   finished_at=?, updated_at=?
+                   WHERE batch_id=? AND status IN ('pending','processing')""",
+                (now, now, batch["id"]),
+            ).rowcount
+            cur.execute(
+                "UPDATE replay_batches SET cancelled=cancelled+?, updated_at=? WHERE id=?",
+                (cancelled_tasks, now, batch["id"]),
+            )
+            audit.record(cur, "replay_batch_approval_expired", None, None,
+                         {"replay_batch_id": batch["id"],
+                          "submitted_by": batch["operator"],
+                          "risk_level": batch["risk_level"],
+                          "approval_deadline": batch["approval_deadline"],
+                          "cancelled_tasks": cancelled_tasks}, ts=now)
+    return len(due)
 
 
 def pause(db: Database, batch_id: int, operator: str) -> dict:
@@ -286,7 +490,6 @@ def pause(db: Database, batch_id: int, operator: str) -> dict:
         audit.record(cur, "replay_batch_paused", None, None,
                      {"replay_batch_id": batch_id, "operator": operator}, ts=now)
     return {"result": "paused", "batch_id": batch_id}
-
 
 def resume(db: Database, batch_id: int, operator: str) -> dict:
     """继续：从暂停处恢复，未完成的任务按各自位置继续执行。"""
@@ -310,8 +513,9 @@ def cancel(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
     now = time.time()
     with db.tx() as cur:
         batch = _get_batch_or_404(db, batch_id)
-        if batch["status"] not in ("running", "paused"):
+        if batch["status"] not in ("running", "paused", "pending_approval"):
             raise HTTPException(409, f"batch is {batch['status']}, cannot cancel")
+        awaiting_approval = batch["status"] == "pending_approval"
         cancelled_tasks = cur.execute(
             """UPDATE replay_tasks SET status='cancelled', blocked_reason=NULL,
                finished_at=?, updated_at=?
@@ -336,13 +540,19 @@ def cancel(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
             audit.record(cur, "effect_cancelled", row["external_id"], row["delivery_id"],
                          {"replay_batch_id": batch_id, "replay_task_id": row["task_id"],
                           "cancelled": row["c"], "reason": "replay_batch_cancelled"}, ts=now)
-        cur.execute(
+        # 条件更新与并发的批准/拒绝/超时互斥（写事务串行 + 状态守卫）；
+        # 待审批期间取消时保留 pending 审批轨迹，另在审计里标注撤回
+        expected_status = "pending_approval" if awaiting_approval else batch["status"]
+        changed = cur.execute(
             """UPDATE replay_batches SET status='cancelled', cancelled=cancelled+?,
-               updated_at=?, finished_at=? WHERE id=?""",
-            (cancelled_tasks, now, now, batch_id),
-        )
+               updated_at=?, finished_at=? WHERE id=? AND status=?""",
+            (cancelled_tasks, now, now, batch_id, expected_status),
+        ).rowcount
+        if not changed:  # 并发下批次已被批准/拒绝/超时
+            raise HTTPException(409, "batch is no longer in the state read at cancel time")
         audit.record(cur, "replay_batch_cancelled", None, None,
                      {"replay_batch_id": batch_id, "operator": operator, "note": note,
+                      "was_awaiting_approval": awaiting_approval,
                       "cancelled_tasks": cancelled_tasks,
                       "done": batch["done"], "failed": batch["failed"]}, ts=now)
     return {"result": "cancelled", "batch_id": batch_id,
@@ -415,6 +625,10 @@ def _live_blocked_reason(batch, task, predecessor, in_flight: int,
     """
     if task["status"] != "pending":
         return None
+    if batch["status"] == "pending_approval":
+        return "awaiting_approval"
+    if batch["status"] == "rejected":
+        return "batch_rejected"
     if batch["status"] == "paused":
         return "batch_paused"
     if batch["status"] == "cancelled":
@@ -431,6 +645,31 @@ def _live_blocked_reason(batch, task, predecessor, in_flight: int,
     return None
 
 
+def _approval_view(row, now: float | None = None) -> dict:
+    """批次当前审批状态与操作者：发起人、审批人、决定时间/原因，以及待决是否已超时。
+
+    approved/可执行的前提是 approval_status='approved'；expired_on_time 只用于
+    详情提示——状态转移以 worker 下一轮扫描（或手动 run_once）为准。
+    """
+    now = time.time() if now is None else now
+    view = {
+        "risk_level": row["risk_level"],
+        "approval_note": row["approval_note"],
+        "status": row["approval_status"],
+        "submitted_by": row["operator"],
+        "approver": row["approver"],
+        "approved_at": row["approved_at"],
+        "rejection_reason": row["approval_reason"],
+        "deadline": row["approval_deadline"],
+        "expired_on_time": (
+            row["status"] == BATCH_PENDING_APPROVAL
+            and row["approval_status"] == APPROVAL_PENDING
+            and row["approval_deadline"] is not None
+            and row["approval_deadline"] <= now),
+    }
+    return view
+
+
 def _batch_view(row) -> dict:
     out = {k: row[k] for k in row.keys()}
     out["filters"] = json.loads(out["filters"])
@@ -438,7 +677,8 @@ def _batch_view(row) -> dict:
 
 
 def batch_detail(db: Database, batch_id: int) -> dict:
-    """批次详情：进度计数、并发占用/等待数量、每条任务状态与实时阻塞原因。"""
+    """批次详情：进度计数、并发占用/等待数量、审批状态/操作者、每条任务状态与
+    实时阻塞原因。"""
     batch = _get_batch_or_404(db, batch_id)
     tasks = db.query("SELECT * FROM replay_tasks WHERE batch_id=? ORDER BY id", (batch_id,))
     now = time.time()
@@ -454,6 +694,7 @@ def batch_detail(db: Database, batch_id: int) -> dict:
     out = _batch_view(batch)
     out["in_flight"] = in_flight  # 当前占用：正在处理的任务数（并发配额的占用量）
     out["waiting"] = waiting      # 等待数量：尚未进入执行的任务数
+    out["approval"] = _approval_view(batch, now)  # 当前审批状态与操作者
     return {"batch": out, "tasks": views}
 
 
@@ -480,9 +721,11 @@ def batch_events(db: Database, batch_id: int, task_id: int | None, limit: int) -
 class ReplayWorker:
     """逐条执行重放任务；与主 worker 相同的重试/退避语义，任务级隔离不互相阻塞。
 
-    领取闸门（_process_one 的占位事务）统一复核：批次在跑 -> 同编号前序版本已进
-    终态 -> 批次并发配额未满，三者都满足才占位执行；被挡下的任务记录阻塞原因
-    （状态展示 + 审计），下一轮换到槽位/前序终态后自动放行。
+    每轮先扫审批超时（到期未决的高风险批次整体取消），再走领取闸门——
+    _process_one 的占位事务统一复核：批次在跑且审批已通过（或无需审批） ->
+    同编号前序版本已进终态 -> 批次并发配额未满，满足才占位执行；
+    被挡下的任务记录阻塞原因（状态展示 + 审计），下一轮换到槽位/前序终态/
+    审批通过后自动放行。
     """
 
     def __init__(self, db: Database, settings: Settings, handler=business_handler,
@@ -528,10 +771,16 @@ class ReplayWorker:
 
     def run_once(self):
         now = self.clock()
+        # 先处理审批超时：到期仍无人批准的高风险批次整体取消（释放其占住的任务），
+        # 必须先于领取，保证超时批次的任务本轮绝不会被领取
+        expire_approvals(self.db, now)
+        # 待审批批次的 pending 任务也取出交给领取闸门：闸门会以 awaiting_approval
+        # 挡下（原因变化才写审计，轮询不刷表）；running 且审批通过/无需审批的才领取
         rows = self.db.query(
             """SELECT t.* FROM replay_tasks t
                JOIN replay_batches b ON b.id = t.batch_id
-               WHERE t.status='pending' AND b.status='running'
+               WHERE t.status='pending'
+                 AND b.status IN ('running','pending_approval')
                  AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?)
                ORDER BY t.id LIMIT 100""",
             (now,),
@@ -584,13 +833,25 @@ class ReplayWorker:
         with self.db.tx() as cur:
             current = cur.execute(
                 """SELECT t.*, b.status AS batch_status,
-                          b.max_concurrency AS batch_max_concurrency
+                          b.max_concurrency AS batch_max_concurrency,
+                          b.approval_status AS batch_approval_status
                    FROM replay_tasks t JOIN replay_batches b ON b.id = t.batch_id
                    WHERE t.id=?""",
                 (task_id,),
             ).fetchone()
-            if current is None or current["status"] != "pending" \
-                    or current["batch_status"] != "running":
+            if current is None or current["status"] != "pending":
+                return
+            # 审批闸门：待审批（含已过截止点但尚未被扫描释放）的高风险批次不得领取，
+            # 原因变化时记一次 blocked 审计；running 只可能来自普通批次（not_required）
+            # 或已被非发起人明确批准（approved）的高风险批次；其余批次状态不再处理
+            if current["batch_status"] == BATCH_PENDING_APPROVAL:
+                self._mark_blocked(cur, current, "awaiting_approval", now)
+                return
+            if current["batch_status"] != "running":
+                return
+            if current["batch_approval_status"] not in (
+                    APPROVAL_NOT_REQUIRED, APPROVAL_APPROVED):
+                self._mark_blocked(cur, current, "awaiting_approval", now)
                 return
             # 同一编号有序执行：存在版本更早且未进终态的前序任务 -> 不可领取
             predecessor = self._open_predecessor(cur, current)
@@ -751,7 +1012,7 @@ class ReplayWorker:
 
 # ---- 路由 ------------------------------------------------------------------
 
-def create_replay_router(db: Database) -> APIRouter:
+def create_replay_router(db: Database, settings: Settings) -> APIRouter:
     router = APIRouter(prefix="/admin/replays", tags=["replays"])
 
     @router.post("/preview")
@@ -761,8 +1022,12 @@ def create_replay_router(db: Database) -> APIRouter:
 
     @router.post("")
     def submit_endpoint(req: SubmitRequest):
-        """一次性提交一批重放任务（批次 + 任务单事务落盘）。"""
-        status, body = submit(db, req)
+        """一次性提交一批重放任务（批次 + 任务单事务落盘）。
+
+        高风险批次（risk_level=high 且带 approval_note）进入 pending_approval，
+        待非发起人批准后才运行。
+        """
+        status, body = submit(db, req, settings.replay_approval_timeout_seconds)
         return JSONResponse(status_code=status, content=body)
 
     @router.get("")
@@ -777,7 +1042,8 @@ def create_replay_router(db: Database) -> APIRouter:
 
     @router.get("/{batch_id}")
     def get_batch(batch_id: int):
-        """批次详情：发起人、原因、筛选快照、进度计数 + 每条任务的状态。"""
+        """批次详情：发起人、原因、筛选快照、审批状态与操作者、进度计数
+        + 每条任务的状态。"""
         return batch_detail(db, batch_id)
 
     @router.get("/{batch_id}/events")
@@ -785,6 +1051,16 @@ def create_replay_router(db: Database) -> APIRouter:
                          limit: int = Query(500, le=2000)):
         """该批次（可选单条任务）的完整审计记录，按时间正序。"""
         return batch_events(db, batch_id, task_id, limit)
+
+    @router.post("/{batch_id}/approve")
+    def approve_endpoint(batch_id: int, req: ApprovalRequest):
+        """批准高风险批次：审批人必须不同于发起人；批准后批次进入 running。"""
+        return approve(db, batch_id, req.operator, req.note)
+
+    @router.post("/{batch_id}/reject")
+    def reject_endpoint(batch_id: int, req: RejectionRequest):
+        """拒绝高风险批次（拒绝原因必填）：未执行任务整体取消，占用随之释放。"""
+        return reject(db, batch_id, req.operator, req.reason, req.note)
 
     @router.post("/{batch_id}/pause")
     def pause_endpoint(batch_id: int, req: BatchActionRequest):

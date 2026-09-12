@@ -8,7 +8,8 @@
 - sink_effects     模拟下游系统的已应用记录（下游按幂等键去重）
 - events           只增不删的审计日志（签名/冲突/重试/处置/重放全部可查）
 - key_config_versions  密钥配置每次切换/尝试的记录（版本、操作者、时间、结果）
-- replay_batches   重放批次：一次提交的一组重放任务（发起人、原因、筛选快照、进度、并发配额）
+- replay_batches   重放批次：一次提交的一组重放任务（发起人、原因、筛选快照、进度、并发配额、
+                    风险等级与审批状态：高风险批次须由非发起人批准后才能进入 running）
 - replay_tasks     单条重放任务：原始版本、状态机、重试位置（checkpoint），批内按内容去重；
                    带版本时间快照（同编号有序执行的排序键）与最近阻塞原因（审计去重用）
 """
@@ -103,9 +104,16 @@ CREATE TABLE IF NOT EXISTS replay_batches (
     request_id  TEXT UNIQUE,           -- 提交幂等键：重复提交返回原批次，不生成第二批任务
     operator    TEXT NOT NULL,         -- 发起人
     reason      TEXT NOT NULL,         -- 重放原因
-    status      TEXT NOT NULL DEFAULT 'running',  -- running|paused|completed|completed_with_failures|cancelled
+    status      TEXT NOT NULL DEFAULT 'running',  -- running|paused|pending_approval|rejected|completed|completed_with_failures|cancelled
     filters     TEXT NOT NULL DEFAULT '{}',       -- 提交时的筛选条件快照（可追溯）
     max_concurrency INTEGER,           -- 批次级并发配额：最多同时处理的任务数；NULL 不限
+    risk_level       TEXT NOT NULL DEFAULT 'normal',  -- normal|high：高风险须先审批
+    approval_note    TEXT,             -- 提交时的审批说明（高风险必填，随批次可追溯）
+    approval_status  TEXT NOT NULL DEFAULT 'not_required',  -- not_required|pending|approved|rejected|expired
+    approver         TEXT,             -- 批准/拒绝人（须不同于发起人 operator）
+    approval_reason  TEXT,             -- 拒绝原因（拒绝时必填）
+    approved_at      REAL,             -- 明确批准的时间（epoch 秒）；NULL 表示尚未批准
+    approval_deadline REAL,            -- 高风险批次的审批截止时间；超时未决由 worker 释放
     total       INTEGER NOT NULL DEFAULT 0,       -- 进度：任务总数 / 各终态计数
     done        INTEGER NOT NULL DEFAULT 0,
     failed      INTEGER NOT NULL DEFAULT 0,
@@ -171,6 +179,19 @@ class Database:
             if cols and "max_concurrency" not in cols:
                 self._conn.execute(
                     "ALTER TABLE replay_batches ADD COLUMN max_concurrency INTEGER")
+            # 高风险审批：老库批次视为普通风险、无需审批（已在跑/已收尾的批次状态不变）
+            for name, ddl in (
+                ("risk_level", "TEXT NOT NULL DEFAULT 'normal'"),
+                ("approval_note", "TEXT"),
+                ("approval_status", "TEXT NOT NULL DEFAULT 'not_required'"),
+                ("approver", "TEXT"),
+                ("approval_reason", "TEXT"),
+                ("approved_at", "REAL"),
+                ("approval_deadline", "REAL"),
+            ):
+                if name not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE replay_batches ADD COLUMN {name} {ddl}")
         if "replay_tasks" in tables:
             cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(replay_tasks)")}
             if cols and "delivery_created_at" not in cols:
