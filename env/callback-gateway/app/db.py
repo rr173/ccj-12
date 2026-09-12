@@ -8,8 +8,9 @@
 - sink_effects     模拟下游系统的已应用记录（下游按幂等键去重）
 - events           只增不删的审计日志（签名/冲突/重试/处置/重放全部可查）
 - key_config_versions  密钥配置每次切换/尝试的记录（版本、操作者、时间、结果）
-- replay_batches   重放批次：一次提交的一组重放任务（发起人、原因、筛选快照、进度）
-- replay_tasks     单条重放任务：原始版本、状态机、重试位置（checkpoint），批内按内容去重
+- replay_batches   重放批次：一次提交的一组重放任务（发起人、原因、筛选快照、进度、并发配额）
+- replay_tasks     单条重放任务：原始版本、状态机、重试位置（checkpoint），批内按内容去重；
+                   带版本时间快照（同编号有序执行的排序键）与最近阻塞原因（审计去重用）
 """
 from __future__ import annotations
 
@@ -104,6 +105,7 @@ CREATE TABLE IF NOT EXISTS replay_batches (
     reason      TEXT NOT NULL,         -- 重放原因
     status      TEXT NOT NULL DEFAULT 'running',  -- running|paused|completed|completed_with_failures|cancelled
     filters     TEXT NOT NULL DEFAULT '{}',       -- 提交时的筛选条件快照（可追溯）
+    max_concurrency INTEGER,           -- 批次级并发配额：最多同时处理的任务数；NULL 不限
     total       INTEGER NOT NULL DEFAULT 0,       -- 进度：任务总数 / 各终态计数
     done        INTEGER NOT NULL DEFAULT 0,
     failed      INTEGER NOT NULL DEFAULT 0,
@@ -126,6 +128,8 @@ CREATE TABLE IF NOT EXISTS replay_tasks (
     next_retry_at REAL,                -- 下次可重试时间（epoch 秒），NULL 表示立即可执行
     checkpoint    TEXT,                -- JSON：处理位置快照，重启后从这里继续
     last_error    TEXT,
+    delivery_created_at REAL,          -- 原始版本的落盘时间快照：同编号有序执行的排序键
+    blocked_reason  TEXT,              -- worker 维护的最近阻塞原因（审计去重用；实时原因见批次详情）
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     finished_at   REAL,
@@ -134,6 +138,7 @@ CREATE TABLE IF NOT EXISTS replay_tasks (
 CREATE INDEX IF NOT EXISTS idx_replay_tasks_pick ON replay_tasks(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_replay_tasks_batch ON replay_tasks(batch_id);
 CREATE INDEX IF NOT EXISTS idx_replay_tasks_active ON replay_tasks(delivery_id, status);
+CREATE INDEX IF NOT EXISTS idx_replay_tasks_order ON replay_tasks(batch_id, external_id, status);
 """
 
 
@@ -161,6 +166,24 @@ class Database:
                 self._conn.execute(
                     "ALTER TABLE outbox ADD COLUMN replay_task_id INTEGER "
                     "REFERENCES replay_tasks(id)")
+        if "replay_batches" in tables:
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(replay_batches)")}
+            if cols and "max_concurrency" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE replay_batches ADD COLUMN max_concurrency INTEGER")
+        if "replay_tasks" in tables:
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(replay_tasks)")}
+            if cols and "delivery_created_at" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE replay_tasks ADD COLUMN delivery_created_at REAL")
+                # 回填排序键：取自原始版本的落盘时间（deliveries 永不改写 created_at）
+                self._conn.execute(
+                    """UPDATE replay_tasks SET delivery_created_at =
+                       (SELECT created_at FROM deliveries
+                        WHERE deliveries.id = replay_tasks.delivery_id)""")
+            if cols and "blocked_reason" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE replay_tasks ADD COLUMN blocked_reason TEXT")
 
     @contextmanager
     def tx(self):

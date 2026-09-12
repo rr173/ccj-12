@@ -42,6 +42,11 @@
 | 每条重放记录发起人、原始版本、原因、进度 | `replay_tasks` 逐条冗余 operator/reason/delivery_id，状态机 + attempts + checkpoint 即进度 |
 | 同一份内容重复加入不生成第二个重放任务 | 批内 `UNIQUE(batch_id, delivery_id)`；`request_id` 重复提交返回原批次；跨批存在活动任务的投递自动跳过 |
 | 重放可暂停/继续/取消 | `POST /admin/replays/{id}/pause|resume|cancel`；取消时未执行任务与滞留副作用同事务取消 |
+| 批次级并发配额 | 提交时 `max_concurrency` 指定整批最多同时处理多少条；占用=本批 `processing` 任务数，领取时在占位事务里实时推导复核，见 `app/replay.py` |
+| 同一编号多条历史版本按 created_at 先后执行 | 任务落盘快照 `delivery_created_at` 作排序键；前序未进终态（done/failed/cancelled）时条件更新拒绝领取后一条 |
+| 批次详情显示占用/等待/每条阻塞原因 | `GET /admin/replays/{id}`：`in_flight`（当前占用）、`waiting`（等待数量）、每条任务的 `blocked_reason`（实时计算） |
+| 暂停/取消/重启后配额正确回收 | 配额无计数器：任务离开 `processing`（完成/失败/取消/recover 退回）槽位即释放，不会永久卡住 |
+| 额度不足/顺序冲突/失败重试/取消都有状态与审计 | `replay_task_blocked`（原因变化才写，轮询不刷表）+ 既有 `replay_task_retry_scheduled`/`replay_task_failed`/`replay_batch_cancelled` 事件 |
 | 重启后未完成任务从上次位置继续 | 启动时 `ReplayWorker.recover()` 把卡在 processing 的任务退回 pending，attempts/checkpoint 都在库里 |
 | 失败单独重试、不阻塞其他编号 | 任务级指数退避，超限标记 `failed`，`POST /admin/replays/tasks/{id}/retry` 单条重试 |
 | 重放副作用与正常处理同样的幂等保护 | 重放副作用落同一 `outbox`（`replay_task_id` 标识），幂等键以 `replay:{task_id}` 为作用域，同一派发器 + 下游去重 |
@@ -59,7 +64,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 49 个端到端测试
+python -m pytest tests/          # 61 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -157,15 +162,19 @@ curl -X POST localhost:8000/admin/replays/preview \
 #    active_replay_in_batch:N（另一批里已有该内容的活动重放任务）
 
 # 2) 提交一批重放任务（批次 + 全部任务单事务落盘；request_id 为提交幂等键，
-#    重复提交返回原批次，不会生成第二批任务）
+#    重复提交返回原批次，不会生成第二批任务；
+#    max_concurrency 可选：整个批次最多同时处理多少条任务，缺省不限）
 curl -X POST localhost:8000/admin/replays \
   -H 'Content-Type: application/json' \
   -d '{"external_id": "A-1001", "status": "done",
-       "operator": "ops-li", "reason": "下游丢数据需补发", "request_id": "req-20260912-01"}'
+       "operator": "ops-li", "reason": "下游丢数据需补发", "request_id": "req-20260912-01",
+       "max_concurrency": 2}'
 # -> {"result": "created", "batch_id": 1, "total": 1, "skipped": []}
 
 # 3) 跟踪进度 / 控制执行
-curl localhost:8000/admin/replays/1            # 批次详情：进度计数 + 每条任务状态
+#    批次详情：进度计数 + max_concurrency + in_flight（当前占用）+ waiting（等待数量）
+#    + 每条任务状态与 blocked_reason（被阻塞的原因，可执行为 null）
+curl localhost:8000/admin/replays/1
 curl -X POST localhost:8000/admin/replays/1/pause  -H 'Content-Type: application/json' -d '{"operator": "ops-li"}'
 curl -X POST localhost:8000/admin/replays/1/resume -H 'Content-Type: application/json' -d '{"operator": "ops-li"}'
 curl -X POST localhost:8000/admin/replays/1/cancel -H 'Content-Type: application/json' -d '{"operator": "ops-li", "note": "改走线下"}'
@@ -181,6 +190,19 @@ curl 'localhost:8000/admin/replays/1/events?task_id=3'
 
 - 只有 `done` / `quarantined` 的版本可重放；仍在管线中、冲突冻结中、人工未选中的
   版本会被跳过并在预览/提交响应里给出原因。
+- **批次级并发配额**：`max_concurrency` 限制整批同时处理的任务数。占用量不存
+  计数器，而是领取时在占位事务里实时数本批 `processing` 任务数——任务完成、
+  失败退避、被取消、或重启时被 recover 退回，槽位都立即释放，暂停/取消/重启
+  之后配额天然正确，不会有任务因配额泄漏而永久卡住。
+- **同一编号有序执行**：同一批次里同一 `external_id` 的多条历史版本按版本落盘
+  时间（`delivery_created_at` 快照，相同再按 `delivery_id`）先后执行；前一条
+  未进终态（done/failed/cancelled）时后一条不能被 worker 领取。前序失败退避
+  期间后一条等待；前序终态失败/被取消后后一条放行，不会死锁。
+- **被阻塞任务的状态与审计**：批次详情里每条 pending 任务带实时 `blocked_reason`
+  —— `batch_paused` / `retry_backoff` / `waiting_predecessor:{task_id}` /
+  `quota_exhausted:{占用}/{上限}`；worker 每轮复核领取闸门，原因变化时写
+  `replay_task_blocked` 审计事件（不变不重复写），与失败重试、取消的既有事件
+  一样可按批次/任务查询。
 - 重放副作用与正常处理**走同一条 outbox 幂等链路**：幂等键以 `replay:{task_id}`
   为作用域——同一任务重试、服务重启都不会重复派发，下游仍按幂等键去重；
   新批次的重放才会有意再次产生外部效果。
@@ -213,8 +235,13 @@ curl 'localhost:8000/admin/replays/1/events?task_id=3'
   人工选定后，未选中版本滞留在 outbox 的副作用在同一事务里置为 `cancelled`
   （内容保留可查），派发器只放行「done 且未冻结」版本——旧版本不会再对外产生效果。
 - **隔离不蔓延**：隔离是 per-delivery 的状态，worker 拉取时天然跳过，其他编号照常处理。
-- **重放即审计**：重放的每个动作（创建/暂停/继续/取消/执行/失败/人工重试）都写
-  `events` 并带 `replay_batch_id`/`replay_task_id`，一批重放的完整轨迹一次查全；
-  重放任务只引用落盘原文（delivery_id），不复制内容，原始版本永不改写。
-- **老库就地升级**：首次以新版本打开旧库时自动给 `outbox` 补 `replay_task_id` 列，
-  无需手工迁移。
+- **重放即审计**：重放的每个动作（创建/暂停/继续/取消/执行/被配额或顺序挡下/
+  失败/人工重试）都写 `events` 并带 `replay_batch_id`/`replay_task_id`，一批重放
+  的完整轨迹一次查全；重放任务只引用落盘原文（delivery_id），不复制内容，
+  原始版本永不改写。
+- **并发配额实时推导**：批次占用量 = 该批 `processing` 任务数，领取与复核在同一
+  写事务里完成（SQLite 写事务串行，多副本也不会超领）；不维护任何计数器，
+  因此暂停/取消/崩溃重启都不存在「忘了释放」的路径。
+- **老库就地升级**：首次以新版本打开旧库时自动给 `outbox` 补 `replay_task_id` 列、
+  给 `replay_batches`/`replay_tasks` 补 `max_concurrency`/`delivery_created_at`/
+  `blocked_reason` 列（存量任务的排序键从 deliveries 回填），无需手工迁移。

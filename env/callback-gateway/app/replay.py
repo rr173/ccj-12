@@ -7,11 +7,20 @@
 - 同一份内容不会生成第二个重放任务：批内 UNIQUE(batch_id, delivery_id) 去重；
   提交带 request_id 时重复提交返回原批次；跨批存在活动任务（pending/processing）
   的投递会被跳过（已完成的批次不阻塞以后再次重放——那是有意为之的新批次）；
+- 批次级并发配额：提交时可指定 max_concurrency（整个批次最多同时处理多少条），
+  占用量 = 本批 processing 中的任务数，领取时在占位事务里实时推导——任务离开
+  processing（完成/失败/取消/重启回收）槽位即释放，不存在需要单独回收的计数器，
+  暂停/取消/重启后配额天然正确，任务不会永久卡住；
+- 同一编号有序执行：同批次同 external_id 的多条历史版本按版本落盘时间
+  （delivery_created_at 快照，再按 delivery_id 决胜）先后执行，前一条未进终态
+  （done/failed/cancelled）时后一条不能被 worker 领取；
+- 被配额/顺序挡住的任务：worker 在原因变化时写 replay_task_blocked 审计（轮询不
+  重复刷），批次详情实时展示当前占用、等待数量和每条任务的阻塞原因；
 - 批次可暂停/继续/取消；取消时未执行的任务与滞留的待派发副作用同事务取消；
   正在处理的任务同样标记 cancelled，其迟到的完成/失败结果落库时被条件更新
   挡下（保持 cancelled，不落副作用、不写完成记录），审计留 discarded 事件；
 - 重启后 recover() 把卡在 processing 的任务退回 pending，从上次位置（attempts/
-  checkpoint/next_retry_at 都落库）继续；
+  checkpoint/next_retry_at 都落库）继续，占用的配额随之释放；
 - 失败按指数退避单独重试，超限标记 failed，可人工单条重试，不阻塞其他编号；
 - 重放副作用的幂等键以 replay:{task_id} 为作用域：同一任务重试/重启不会重复派发，
   下游仍按幂等键去重（与正常处理同一套 outbox + sink 保护）；新批次新任务才会
@@ -29,7 +38,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import audit
 from .config import Settings
@@ -68,6 +77,8 @@ class SubmitRequest(ReplayFilter):
     operator: str                  # 发起人（必填，落每条任务与审计）
     reason: str                    # 重放原因（必填）
     request_id: str | None = None  # 提交幂等键：重复提交返回原批次
+    # 批次级并发配额：整个批次最多同时处理多少条任务；NULL 表示不限
+    max_concurrency: int | None = Field(default=None, ge=1)
 
 
 class BatchActionRequest(BaseModel):
@@ -210,32 +221,35 @@ def submit(db: Database, req: SubmitRequest) -> tuple[int, dict]:
                      "matched": len(rows), "skipped": skipped}
 
     now = time.time()
-    filters = req.model_dump(exclude={"operator", "reason", "request_id"})
+    filters = req.model_dump(exclude={"operator", "reason", "request_id", "max_concurrency"})
     filters_json = json.dumps(filters, ensure_ascii=False, default=str)
     try:
         with db.tx() as cur:
             cur.execute(
                 """INSERT INTO replay_batches
-                   (request_id, operator, reason, status, filters, total, created_at, updated_at)
-                   VALUES (?,?,?,'running',?,?,?,?)""",
+                   (request_id, operator, reason, status, filters, max_concurrency,
+                    total, created_at, updated_at)
+                   VALUES (?,?,?,'running',?,?,?,?,?)""",
                 (req.request_id, req.operator, req.reason, filters_json,
-                 len(eligible), now, now),
+                 req.max_concurrency, len(eligible), now, now),
             )
             batch_id = cur.lastrowid
             for d in eligible:
                 # INSERT OR IGNORE + UNIQUE(batch_id, delivery_id)：
-                # 同一份内容重复加入也不会生成第二个重放任务
+                # 同一份内容重复加入也不会生成第二个重放任务；
+                # delivery_created_at 快照原始版本的落盘时间，作为同编号有序执行的排序键
                 cur.execute(
                     """INSERT OR IGNORE INTO replay_tasks
                        (batch_id, delivery_id, external_id, operator, reason,
-                        status, created_at, updated_at)
-                       VALUES (?,?,?,?,?,'pending',?,?)""",
+                        status, delivery_created_at, created_at, updated_at)
+                       VALUES (?,?,?,?,?,'pending',?,?,?)""",
                     (batch_id, d["id"], d["external_id"], req.operator, req.reason,
-                     now, now),
+                     d["created_at"], now, now),
                 )
             audit.record(cur, "replay_batch_created", None, None, {
                 "replay_batch_id": batch_id, "operator": req.operator,
                 "reason": req.reason, "request_id": req.request_id,
+                "max_concurrency": req.max_concurrency,
                 "filters": filters, "total": len(eligible), "skipped": skipped}, ts=now)
     except sqlite3.IntegrityError:
         # 并发下 request_id 撞唯一键：返回已存在的那一批
@@ -299,7 +313,8 @@ def cancel(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
         if batch["status"] not in ("running", "paused"):
             raise HTTPException(409, f"batch is {batch['status']}, cannot cancel")
         cancelled_tasks = cur.execute(
-            """UPDATE replay_tasks SET status='cancelled', finished_at=?, updated_at=?
+            """UPDATE replay_tasks SET status='cancelled', blocked_reason=NULL,
+               finished_at=?, updated_at=?
                WHERE batch_id=? AND status IN ('pending','processing')""",
             (now, now, batch_id),
         ).rowcount
@@ -349,7 +364,7 @@ def retry_task(db: Database, task_id: int, operator: str) -> dict:
             raise HTTPException(409, "batch is cancelled")
         cur.execute(
             """UPDATE replay_tasks SET status='pending', attempts=0, next_retry_at=NULL,
-               last_error=NULL, finished_at=NULL, updated_at=? WHERE id=?""",
+               last_error=NULL, blocked_reason=NULL, finished_at=NULL, updated_at=? WHERE id=?""",
             (now, task_id),
         )
         # 批次若已因失败收尾，重新打开继续跑
@@ -368,6 +383,54 @@ def retry_task(db: Database, task_id: int, operator: str) -> dict:
 
 # ---- 查询 ------------------------------------------------------------------
 
+# 重放任务的终态：前序版本进入其中之一，同编号的后一条才允许被领取
+TERMINAL_TASK_STATUSES = ("done", "failed", "cancelled")
+
+
+def _version_key(task) -> tuple:
+    """同编号历史版本的执行顺序：按落盘时间，再按 delivery_id 决胜（稳定且确定）。"""
+    return (task["delivery_created_at"], task["delivery_id"])
+
+
+def _nearest_open_predecessor(tasks, task):
+    """同批次同编号、版本更早且未进终态的最近一条任务；没有则 None（可执行）。"""
+    if task["delivery_created_at"] is None:
+        return None  # 老库遗留行没有版本时间快照，不参与有序约束
+    earlier = [t for t in tasks
+               if t["external_id"] == task["external_id"]
+               and t["id"] != task["id"]
+               and t["delivery_created_at"] is not None
+               and _version_key(t) < _version_key(task)
+               and t["status"] not in TERMINAL_TASK_STATUSES]
+    if not earlier:
+        return None
+    return max(earlier, key=_version_key)
+
+
+def _live_blocked_reason(batch, task, predecessor, in_flight: int,
+                         now: float) -> str | None:
+    """批次详情里每条 pending 任务「为什么还没被执行」的实时原因（None 表示可执行）。
+
+    与 worker 领取闸门的判定顺序一致：批次状态 -> 退避等待 -> 前序版本 -> 并发配额。
+    """
+    if task["status"] != "pending":
+        return None
+    if batch["status"] == "paused":
+        return "batch_paused"
+    if batch["status"] == "cancelled":
+        return "batch_cancelled"
+    if batch["status"] != "running":
+        return f"batch_not_running:{batch['status']}"
+    if task["next_retry_at"] is not None and task["next_retry_at"] > now:
+        return "retry_backoff"
+    if predecessor is not None:
+        return f"waiting_predecessor:{predecessor['id']}"
+    maxc = batch["max_concurrency"]
+    if maxc is not None and in_flight >= maxc:
+        return f"quota_exhausted:{in_flight}/{maxc}"
+    return None
+
+
 def _batch_view(row) -> dict:
     out = {k: row[k] for k in row.keys()}
     out["filters"] = json.loads(out["filters"])
@@ -375,10 +438,23 @@ def _batch_view(row) -> dict:
 
 
 def batch_detail(db: Database, batch_id: int) -> dict:
+    """批次详情：进度计数、并发占用/等待数量、每条任务状态与实时阻塞原因。"""
     batch = _get_batch_or_404(db, batch_id)
     tasks = db.query("SELECT * FROM replay_tasks WHERE batch_id=? ORDER BY id", (batch_id,))
-    return {"batch": _batch_view(batch),
-            "tasks": [{k: t[k] for k in t.keys()} for t in tasks]}
+    now = time.time()
+    in_flight = sum(1 for t in tasks if t["status"] == "processing")
+    waiting = sum(1 for t in tasks if t["status"] == "pending")
+    views = []
+    for t in tasks:
+        v = {k: t[k] for k in t.keys()}
+        # 实时计算的阻塞原因覆盖库里 worker 维护的最近值（可能滞后一个轮询周期）
+        v["blocked_reason"] = _live_blocked_reason(
+            batch, t, _nearest_open_predecessor(tasks, t), in_flight, now)
+        views.append(v)
+    out = _batch_view(batch)
+    out["in_flight"] = in_flight  # 当前占用：正在处理的任务数（并发配额的占用量）
+    out["waiting"] = waiting      # 等待数量：尚未进入执行的任务数
+    return {"batch": out, "tasks": views}
 
 
 def batch_events(db: Database, batch_id: int, task_id: int | None, limit: int) -> dict:
@@ -402,7 +478,12 @@ def batch_events(db: Database, batch_id: int, task_id: int | None, limit: int) -
 # ---- 重放 worker ------------------------------------------------------------
 
 class ReplayWorker:
-    """逐条执行重放任务；与主 worker 相同的重试/退避语义，任务级隔离不互相阻塞。"""
+    """逐条执行重放任务；与主 worker 相同的重试/退避语义，任务级隔离不互相阻塞。
+
+    领取闸门（_process_one 的占位事务）统一复核：批次在跑 -> 同编号前序版本已进
+    终态 -> 批次并发配额未满，三者都满足才占位执行；被挡下的任务记录阻塞原因
+    （状态展示 + 审计），下一轮换到槽位/前序终态后自动放行。
+    """
 
     def __init__(self, db: Database, settings: Settings, handler=business_handler,
                  clock=time.time):
@@ -428,7 +509,8 @@ class ReplayWorker:
 
     def recover(self) -> int:
         """启动恢复：上次崩溃时卡在 processing 的任务退回 pending，从上次位置继续
-        （attempts/checkpoint/next_retry_at 都在库里；副作用靠幂等键去重不会重发）。"""
+        （attempts/checkpoint/next_retry_at 都在库里；副作用靠幂等键去重不会重发）。
+        这些任务占用的批次并发配额随状态离开 processing 自动释放，无需额外回收。"""
         now = self.clock()
         with self.db.tx() as cur:
             rows = cur.execute(
@@ -457,23 +539,94 @@ class ReplayWorker:
         for row in rows:
             self._process_one(row)
 
+    @staticmethod
+    def _open_predecessor(cur: sqlite3.Cursor, task):
+        """同批次同编号、版本更早且未进终态的最近一条任务；没有则 None（可领取）。"""
+        if task["delivery_created_at"] is None:
+            return None  # 老库遗留行没有版本时间快照，不参与有序约束
+        return cur.execute(
+            """SELECT id, status FROM replay_tasks
+               WHERE batch_id=? AND external_id=? AND id<>?
+                 AND delivery_created_at IS NOT NULL
+                 AND (delivery_created_at < ?
+                      OR (delivery_created_at = ? AND delivery_id < ?))
+                 AND status NOT IN ('done','failed','cancelled')
+               ORDER BY delivery_created_at DESC, delivery_id DESC LIMIT 1""",
+            (task["batch_id"], task["external_id"], task["id"],
+             task["delivery_created_at"], task["delivery_created_at"],
+             task["delivery_id"]),
+        ).fetchone()
+
+    def _mark_blocked(self, cur: sqlite3.Cursor, task, reason: str, now: float,
+                      **detail):
+        """记录任务被领取闸门挡下的原因：仅在原因变化时更新并写审计，
+        轮询期间原因不变不重复刷事件；被领取（或取消/重试）时该字段清空。"""
+        if task["blocked_reason"] == reason:
+            return
+        cur.execute(
+            "UPDATE replay_tasks SET blocked_reason=?, updated_at=? WHERE id=?",
+            (reason, now, task["id"]),
+        )
+        audit.record(cur, "replay_task_blocked", task["external_id"],
+                     task["delivery_id"],
+                     {"replay_batch_id": task["batch_id"],
+                      "replay_task_id": task["id"],
+                      "reason": reason,
+                      "previous_reason": task["blocked_reason"],
+                      **detail}, ts=now)
+
     def _process_one(self, task):
         now = self.clock()
         task_id = task["id"]
-        # 条件更新占位：拉取之后批次可能已被暂停/取消，或任务被人工改动
+        # 领取闸门：占位事务里原子复核——拉取之后批次可能已被暂停/取消，或任务被
+        # 人工改动；同编号前序版本未进终态、批次并发配额已满时都不得领取。
+        # BEGIN IMMEDIATE 串行化所有写事务，检查与占位之间没有竞态。
         with self.db.tx() as cur:
+            current = cur.execute(
+                """SELECT t.*, b.status AS batch_status,
+                          b.max_concurrency AS batch_max_concurrency
+                   FROM replay_tasks t JOIN replay_batches b ON b.id = t.batch_id
+                   WHERE t.id=?""",
+                (task_id,),
+            ).fetchone()
+            if current is None or current["status"] != "pending" \
+                    or current["batch_status"] != "running":
+                return
+            # 同一编号有序执行：存在版本更早且未进终态的前序任务 -> 不可领取
+            predecessor = self._open_predecessor(cur, current)
+            if predecessor is not None:
+                self._mark_blocked(
+                    cur, current, f"waiting_predecessor:{predecessor['id']}", now,
+                    predecessor_task_id=predecessor["id"],
+                    predecessor_status=predecessor["status"])
+                return
+            # 批次级并发配额：占用 = 本批 processing 中的任务数（实时推导，
+            # 任务离开 processing 即释放，不存在需要单独回收的计数器）
+            maxc = current["batch_max_concurrency"]
+            if maxc is not None:
+                in_flight = cur.execute(
+                    "SELECT COUNT(*) AS c FROM replay_tasks "
+                    "WHERE batch_id=? AND status='processing'",
+                    (current["batch_id"],),
+                ).fetchone()["c"]
+                if in_flight >= maxc:
+                    self._mark_blocked(
+                        cur, current, f"quota_exhausted:{in_flight}/{maxc}", now,
+                        in_flight=in_flight, max_concurrency=maxc)
+                    return
             claimed = cur.execute(
-                """UPDATE replay_tasks SET status='processing', attempts=attempts+1, updated_at=?
-                   WHERE id=? AND status='pending'
-                     AND batch_id IN (SELECT id FROM replay_batches WHERE status='running')""",
+                """UPDATE replay_tasks SET status='processing', attempts=attempts+1,
+                   blocked_reason=NULL, updated_at=?
+                   WHERE id=? AND status='pending'""",
                 (now, task_id),
             ).rowcount
             if not claimed:
                 return
-            attempt = task["attempts"] + 1
-            audit.record(cur, "replay_task_processing", task["external_id"],
-                         task["delivery_id"],
-                         {"replay_batch_id": task["batch_id"], "replay_task_id": task_id,
+            attempt = current["attempts"] + 1
+            audit.record(cur, "replay_task_processing", current["external_id"],
+                         current["delivery_id"],
+                         {"replay_batch_id": current["batch_id"],
+                          "replay_task_id": task_id,
                           "attempt": attempt}, ts=now)
 
         delivery = self.db.query_one(
