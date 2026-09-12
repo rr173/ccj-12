@@ -70,6 +70,14 @@ DELIVERY_FAILED = "failed"
 DELIVERY_SENT = "sent"
 DELIVERY_QUARANTINED = "quarantined"
 DELIVERY_CANCELLED = "cancelled"
+# 聚合窗口内暂缓（窗口关闭后由摘要替代，本行置 aggregated 保留可查）
+DELIVERY_HELD = "held"
+# 已被聚合摘要替代（不再单独发送，内容保留）
+DELIVERY_AGGREGATED = "aggregated"
+# 静默时段内暂缓（时段结束按 ordinal 原事件顺序放行回 pending）
+DELIVERY_DELAYED = "delayed"
+# 尚未发送、可能被取消/暂缓/退避的状态（待办关闭或升级停止时统一取消）
+UNSENT_DELIVERY_STATES = ("pending", "failed", "held", "delayed")
 
 # 可回写动作 -> 节点端点 action
 BATCH_ACTIONS = ("approve", "reject", "skip")
@@ -176,15 +184,22 @@ def _change_recipients(cur: sqlite3.Cursor, change_id: int,
 
 
 def _insert_deliveries(cur: sqlite3.Cursor, todo_id: int, recipient: str,
-                       subject: str, body: str, payload: dict, now: float) -> int:
-    """按联系人启用通道生成邮件/webhook 投递行（无通道则 0 条）。"""
+                       subject: str, body: str, payload: dict, now: float) -> dict:
+    """按联系人启用通道生成邮件/webhook 投递行（无通道则 0 条）。
+
+    聚合规则命中时投递落 held 并入组（窗口关闭后由摘要替代）；否则静默时段命中时
+    落 delayed（时段结束按 ordinal 原事件顺序放行）；都不命中才是立即可发的 pending。
+    路由逻辑集中在 notif_policy（本模块在函数内惰性导入，避免循环依赖）。
+    返回 {"created": n, "held": n, "delayed": n, "immediate": n}。
+    """
+    from . import notif_policy
     contact = cur.execute(
         "SELECT * FROM approval_contacts WHERE name=? AND active=1",
         (recipient,)).fetchone()
     if contact is None:
-        return 0
+        return {"created": 0, "held": 0, "delayed": 0, "immediate": 0}
     channels = json.loads(contact["channels"])
-    count = 0
+    counts = {"created": 0, "held": 0, "delayed": 0, "immediate": 0}
     for channel in channels:
         if channel == CHANNEL_EMAIL:
             address = contact["email"]
@@ -198,38 +213,86 @@ def _insert_deliveries(cur: sqlite3.Cursor, todo_id: int, recipient: str,
             cpayload = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
         else:
             continue
+        todo = cur.execute("SELECT * FROM approval_todos WHERE id=?",
+                           (todo_id,)).fetchone()
+        # 1) 聚合：命中规则 -> held 入组（窗口关闭合并为一条摘要）
+        group = notif_policy.find_aggregation_group(
+            cur, todo=todo, recipient=recipient, channel=channel, now=now)
+        if group is not None:
+            cur.execute(
+                """INSERT INTO approval_notification_deliveries
+                   (todo_id, recipient, channel, address, subject, body, payload,
+                    status, next_retry_at, group_id, ordinal, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?, 'held', NULL, ?, ?, ?, ?)""",
+                (todo_id, recipient, channel, address, subject, body, cpayload,
+                 group["id"], todo_id, now, now))
+            delivery_id = cur.lastrowid
+            cur.execute(
+                """INSERT OR IGNORE INTO approval_notification_group_members
+                   (group_id, delivery_id, todo_id, event_id, event_type, joined_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (group["id"], delivery_id, todo_id, todo["event_id"],
+                 todo["event_type"], now))
+            notif_policy.audit_held(cur, delivery_id=delivery_id, todo=todo,
+                                    recipient=recipient, channel=channel,
+                                    group=group, now=now)
+            counts["created"] += 1
+            counts["held"] += 1
+            continue
+        # 2) 静默时段：命中 -> delayed（站内待办已即时生成，仅外发暂缓）
+        resume_at = notif_policy.quiet_resume_at(
+            cur, recipient=recipient, channel=channel, now=now)
+        if resume_at is not None:
+            cur.execute(
+                """INSERT INTO approval_notification_deliveries
+                   (todo_id, recipient, channel, address, subject, body, payload,
+                    status, next_retry_at, delayed_until, ordinal, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?, 'delayed', NULL, ?, ?, ?, ?)""",
+                (todo_id, recipient, channel, address, subject, body, cpayload,
+                 resume_at, todo_id, now, now))
+            notif_policy.audit_delayed(cur, delivery_id=cur.lastrowid, todo=todo,
+                                       recipient=recipient, channel=channel,
+                                       resume_at=resume_at, now=now)
+            counts["created"] += 1
+            counts["delayed"] += 1
+            continue
+        # 3) 常规：立即可发（ordinal=待办 id，静默放行后据此恢复原事件顺序）
         cur.execute(
             """INSERT INTO approval_notification_deliveries
                (todo_id, recipient, channel, address, subject, body, payload,
-                status, next_retry_at, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,'pending',?,?,?)""",
+                status, next_retry_at, ordinal, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?,?)""",
             (todo_id, recipient, channel, address, subject, body, cpayload,
-             now, now, now))
-        count += 1
-    return count
+             todo_id, now, now))
+        counts["created"] += 1
+        counts["immediate"] += 1
+    return counts
 
 
 def _create_todos(cur: sqlite3.Cursor, event_row: sqlite3.Row,
                   recipients: set[str], now: float) -> int:
-    """为事件的每个接收人幂等生成站内待办 + 外发投递；返回新建待办数。"""
+    """为事件的每个接收人幂等生成站内待办 + 外发投递；返回新建待办数。
+
+    站内待办始终即时逐条生成（聚合只合并外发、绝不吞掉可操作待办）；外发投递按
+    聚合/静默规则路由（held/delayed/pending）。"""
     created = 0
     for recipient in sorted(recipients):
         try:
             cur.execute(
                 """INSERT INTO approval_todos
                    (event_id, recipient, status, source_type, batch_id, change_id,
-                    node_id, event_type, event_version, actionable, title,
+                    node_id, event_type, event_version, actionable, title, open_at,
                     created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (event_row["id"], recipient, TODO_UNREAD, event_row["source_type"],
                  event_row["batch_id"], event_row["change_id"], event_row["node_id"],
                  event_row["event_type"], event_row["state_version"],
-                 event_row["actionable"], event_row["subject"], now, now))
+                 event_row["actionable"], event_row["subject"], now, now, now))
         except sqlite3.IntegrityError:
             # UNIQUE(event_id, recipient)：重放/并发下该接收人已有待办，跳过
             continue
         todo_id = cur.lastrowid
-        deliveries = _insert_deliveries(
+        routing = _insert_deliveries(
             cur, todo_id, recipient, event_row["subject"], event_row["body"],
             json.loads(event_row["payload"]), now)
         audit.record(cur, "approval_todo_generated", None, None, {
@@ -240,7 +303,9 @@ def _create_todos(cur: sqlite3.Cursor, event_row: sqlite3.Row,
             "change_id": event_row["change_id"], "node_id": event_row["node_id"],
             "recipient": recipient, "event_version": event_row["state_version"],
             "actionable": bool(event_row["actionable"]),
-            "deliveries_created": deliveries}, ts=now)
+            "deliveries_created": routing["created"],
+            "deliveries_held": routing["held"],
+            "deliveries_delayed": routing["delayed"]}, ts=now)
         created += 1
     return created
 
@@ -593,8 +658,12 @@ def sweep_stale_todos(db: Database, now: float | None = None) -> int:
                 (new_status, reason, now, now, todo["id"]))
             cur.execute(
                 """UPDATE approval_notification_deliveries SET status='cancelled',
-                   updated_at=? WHERE todo_id=? AND status IN ('pending','failed')""",
+                   updated_at=? WHERE todo_id=? AND status IN ('pending','failed','held','delayed')""",
                 (now, todo["id"]))
+            # 来源落定：升级随之停止（后续级别不再触发，已升级别未发出投递取消）
+            from . import notif_policy
+            notif_policy.stop_escalations_for_todo_tx(
+                cur, todo["id"], reason="source_closed", now=now)
             audit.record(cur, "approval_todo_closed", None, None, {
                 "todo_id": todo["id"], "recipient": todo["recipient"],
                 "event_type": todo["event_type"],
@@ -686,8 +755,11 @@ def act_on_todo(db: Database, todo_id: int, req: TodoActRequest) -> dict:
                 (new_status, now, now, todo_id))
             cur.execute(
                 """UPDATE approval_notification_deliveries SET status='cancelled',
-                   updated_at=? WHERE todo_id=? AND status IN ('pending','failed')""",
+                   updated_at=? WHERE todo_id=? AND status IN ('pending','failed','held','delayed')""",
                 (now, todo_id))
+            from . import notif_policy
+            notif_policy.stop_escalations_for_todo_tx(
+                cur, todo_id, reason="source_closed", now=now)
             audit.record(cur, "approval_todo_closed", None, None, {
                 "todo_id": todo_id, "recipient": operator,
                 "event_type": todo["event_type"],
@@ -729,8 +801,13 @@ def act_on_todo(db: Database, todo_id: int, req: TodoActRequest) -> dict:
             raise HTTPException(409, "todo was concurrently handled")
         cur.execute(
             """UPDATE approval_notification_deliveries SET status='cancelled',
-               updated_at=? WHERE todo_id=? AND status IN ('pending','failed')""",
+               updated_at=? WHERE todo_id=? AND status IN ('pending','failed','held','delayed')""",
             (now, todo_id))
+        # 原接收人处理后升级通知必须停止：后续级别不再触发，已升级别未发出的投递取消
+        # （同事务，与原决定原子提交）。
+        from . import notif_policy
+        notif_policy.stop_escalations_for_todo_tx(
+            cur, todo_id, reason="handled", now=now)
         audit.record(cur, "approval_todo_handled", None, None, {
             "todo_id": todo_id, "recipient": operator, "action": action,
             "event_type": todo["event_type"],
@@ -756,6 +833,12 @@ def _todo_view(cur: sqlite3.Cursor, todo, now: float) -> dict:
     failed = [d["channel"] for d in deliveries if d["status"] == DELIVERY_FAILED]
     quarantined = [d["channel"] for d in deliveries
                    if d["status"] == DELIVERY_QUARANTINED]
+    held = [{"channel": d["channel"], "group_id": d["group_id"]}
+            for d in deliveries if d["status"] == DELIVERY_HELD]
+    delayed = [{"channel": d["channel"], "delayed_until": d["delayed_until"]}
+               for d in deliveries if d["status"] == DELIVERY_DELAYED]
+    aggregated = [d["channel"] for d in deliveries
+                  if d["status"] == DELIVERY_AGGREGATED]
     event = cur.execute("SELECT subject, body, event_type, state_version FROM "
                         "approval_notify_events WHERE id=?",
                         (todo["event_id"],)).fetchone()
@@ -777,10 +860,41 @@ def _todo_view(cur: sqlite3.Cursor, todo, now: float) -> dict:
         "deliveries": [{"id": d["id"], "channel": d["channel"], "address": d["address"],
                         "status": d["status"], "attempts": d["attempts"],
                         "next_retry_at": d["next_retry_at"],
-                        "last_error": d["last_error"], "sent_at": d["sent_at"]}
+                        "last_error": d["last_error"], "sent_at": d["sent_at"],
+                        "group_id": d["group_id"],
+                        "delayed_until": d["delayed_until"],
+                        "ordinal": d["ordinal"]}
                        for d in deliveries],
         "failed_channels": failed, "quarantined_channels": quarantined,
+        "held_channels": held, "delayed_channels": delayed,
+        "aggregated_channels": aggregated,
+        # 该待办作为「原始接收人待办」时的升级状态（未升级为 None）
+        "escalation": _escalation_view(cur, todo["id"]),
     }
+
+
+def _escalation_view(cur: sqlite3.Cursor, todo_id: int) -> dict | None:
+    rows = cur.execute(
+        "SELECT * FROM approval_escalations WHERE base_todo_id=? ORDER BY policy_id, id",
+        (todo_id,)).fetchall()
+    if not rows:
+        return None
+    out = []
+    for esc in rows:
+        levels = cur.execute(
+            "SELECT * FROM approval_escalation_levels WHERE escalation_id=? "
+            "ORDER BY level", (esc["id"],)).fetchall()
+        out.append({
+            "escalation_id": esc["id"], "policy_id": esc["policy_id"],
+            "status": esc["status"], "levels_total": esc["levels_total"],
+            "levels_fired": esc["levels_fired"], "stop_reason": esc["stop_reason"],
+            "stopped_at": esc["stopped_at"],
+            "fired_levels": [{"level": lv["level"],
+                              "recipients": json.loads(lv["recipients"]),
+                              "fired_at": lv["fired_at"],
+                              "notify_event_id": lv["notify_event_id"]}
+                             for lv in levels]})
+    return out
 
 
 def _filter_todos(db: Database, *, recipient: str | None = None,
@@ -868,7 +982,6 @@ def todo_summary(db: Database, recipient: str | None = None) -> dict:
     if recipient:
         dwhere.append("t.recipient=?")
         dparams.append(recipient)
-    dwhere.append("d.status IN ('failed','quarantined')")
     dsql = (f"SELECT d.status AS status, COUNT(*) AS c FROM "
             f"approval_notification_deliveries d {djoin}")
     if dwhere:
@@ -882,8 +995,14 @@ def todo_summary(db: Database, recipient: str | None = None) -> dict:
         "handled": counts.get(TODO_HANDLED, 0),
         "expired": counts.get(TODO_EXPIRED, 0),   # 过期待办数量
         "cancelled": counts.get(TODO_CANCELLED, 0),
+        "delivery_pending": delivery_counts.get(DELIVERY_PENDING, 0),
         "delivery_failed": delivery_counts.get(DELIVERY_FAILED, 0),
         "delivery_quarantined": delivery_counts.get(DELIVERY_QUARANTINED, 0),
+        # 聚合窗口内暂缓 / 已被摘要替代 / 静默时段延迟
+        "delivery_held": delivery_counts.get(DELIVERY_HELD, 0),
+        "delivery_aggregated": delivery_counts.get(DELIVERY_AGGREGATED, 0),
+        "delivery_delayed": delivery_counts.get(DELIVERY_DELAYED, 0),
+        "delivery_sent": delivery_counts.get(DELIVERY_SENT, 0),
     }
 
 
@@ -906,7 +1025,19 @@ def _backfill_for_contact(cur, name: str, now: float) -> int:
     created = 0
     for event in events:
         eligible = False
-        if event["source_type"] == SOURCE_BATCH and event["node_id"] is not None:
+        if event["event_type"] == "escalated":
+            # 升级事件：接收人是级别快照中的成员，且来源仍可操作（晚注册不漏关键提醒）
+            if event["source_type"] == SOURCE_BATCH and event["node_id"] is not None:
+                source_open = _batch_node_actionable(cur, _pseudo_todo(event, name))
+            else:
+                source_open = _change_actionable(cur, _pseudo_todo(event, name))
+            if source_open:
+                lv = cur.execute(
+                    """SELECT recipients FROM approval_escalation_levels
+                       WHERE notify_event_id=?""", (event["id"],)).fetchone()
+                if lv is not None and name in json.loads(lv["recipients"]):
+                    eligible = True
+        elif event["source_type"] == SOURCE_BATCH and event["node_id"] is not None:
             if _batch_node_actionable(cur, _pseudo_todo(event, name)):
                 # 还须是该事件节点当前允许的承担人（角色/委托与激活时同口径）
                 recipients = _node_recipients(cur, event["node_id"], exclude=set())
@@ -997,6 +1128,7 @@ def deactivate_contact(db: Database, name: str, req: ContactDeactivateRequest) -
         open_todos = cur.execute(
             """SELECT id FROM approval_todos
                WHERE recipient=? AND status IN ('unread','read')""", (name,)).fetchall()
+        from . import notif_policy
         for t in open_todos:
             cur.execute(
                 """UPDATE approval_todos SET status='cancelled',
@@ -1004,8 +1136,11 @@ def deactivate_contact(db: Database, name: str, req: ContactDeactivateRequest) -
                    WHERE id=?""", (now, now, t["id"]))
             cur.execute(
                 """UPDATE approval_notification_deliveries SET status='cancelled',
-                   updated_at=? WHERE todo_id=? AND status IN ('pending','failed')""",
+                   updated_at=? WHERE todo_id=? AND status IN ('pending','failed','held','delayed')""",
                 (now, t["id"]))
+            # 联系人停用：其原始待办的升级链一并停止
+            notif_policy.stop_escalations_for_todo_tx(
+                cur, t["id"], reason="source_closed", now=now)
         audit.record(cur, "approval_contact_deactivated", None, None,
                      {"name": name, "operator": operator, "reason": req.reason,
                       "closed_todos": len(open_todos)}, ts=now)
@@ -1049,7 +1184,7 @@ def send_delivery(db: Database, delivery_id: int, senders, settings: Settings,
         if todo is None or todo["status"] not in OPEN_TODO_STATUSES:
             cur.execute(
                 """UPDATE approval_notification_deliveries SET status='cancelled',
-                   updated_at=? WHERE id=? AND status IN ('pending','failed')""",
+                   updated_at=? WHERE id=? AND status IN ('pending','failed','held','delayed')""",
                 (now, delivery_id))
             audit.record(cur, "approval_delivery_cancelled", None, None,
                          {"delivery_id": delivery_id, "todo_id": row["todo_id"],
@@ -1108,13 +1243,15 @@ def send_delivery(db: Database, delivery_id: int, senders, settings: Settings,
 
 def dispatch_due(db: Database, senders, settings: Settings,
                  now: float | None = None, limit: int = 100) -> int:
-    """发送所有到期的 pending/failed 投递（隔离/取消的不发）。"""
+    """发送所有到期的 pending/failed 投递（隔离/取消/暂缓的不发）。
+
+    按 (ordinal, id) 排序：静默时段结束批量放行时，按原事件顺序发送。"""
     now = time.time() if now is None else now
     rows = db.query(
         """SELECT * FROM approval_notification_deliveries
            WHERE status IN ('pending','failed')
              AND (next_retry_at IS NULL OR next_retry_at <= ?)
-           ORDER BY id LIMIT ?""", (now, limit))
+           ORDER BY ordinal, id LIMIT ?""", (now, limit))
     for row in rows:
         send_delivery(db, row["id"], senders, settings, now)
     return len(rows)

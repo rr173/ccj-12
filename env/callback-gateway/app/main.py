@@ -26,6 +26,7 @@ from .delegation import create_delegation_router
 from .ingest import ingest
 from .keyconfig import KeyConfigStore, KeyRotationService
 from .notif_worker import NotificationWorker
+from .notif_policy import create_notif_policy_router
 from .notifications import create_notifications_router
 from .replay import ReplayWorker, create_replay_router
 from .replay_policy import create_policy_router
@@ -110,6 +111,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(create_delegation_router(db))
     app.include_router(create_notifications_router(
         db, settings, lambda: notif_worker.senders))
+    app.include_router(create_notif_policy_router(db, settings))
     return app
 
 

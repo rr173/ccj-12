@@ -39,7 +39,19 @@
 - approval_todos          站内待办：同一事件对同一接收人至多一条；记录来源批次/变更单、
                     节点、接收人、事件版本与状态；处理后回写原审批动作，重复/过期/
                     并发处理不重复投票、不越过审批门禁
-- approval_notification_deliveries 邮件/webhook 外发投递：指数退避重试，超限隔离
+- approval_notification_deliveries 邮件/webhook 外发投递：指数退避重试，超限隔离；
+                    聚合窗口内为 held（窗口关闭合并为一条摘要）、静默时段为 delayed
+                    （时段结束按原事件顺序放行）
+- approval_aggregation_rules / approval_notification_groups /
+  approval_notification_group_members  通知聚合：运营按接收人、来源批次与事件类型配置
+                    聚合窗口，窗口内同组重复提醒的邮件/webhook 先 held，窗口关闭合并为
+                    一条摘要（站内待办始终即时生成，不合并、不延迟）
+- approval_quiet_schedules   静默时段：按接收人/通道配置每日重复或一次性时间窗，
+                    窗内邮件/webhook 落 delayed（站内待办保留），时段结束按原事件顺序发送
+- approval_escalation_policies / approval_escalations   升级策略：按节点角色配置逐级
+                    升级接收人与触发时限（待办生成后 N 秒或截止前 N 秒）；每级触发与
+                    升级级别落盘可查；原接收人处理（或来源落定）后升级立即停止，
+                    未发出的升级通知同事务取消
 """
 from __future__ import annotations
 
@@ -415,6 +427,7 @@ CREATE TABLE IF NOT EXISTS approval_todos (
     event_version INTEGER NOT NULL,           -- 生成时的事件版本（乐观门禁/展示）
     actionable    INTEGER NOT NULL DEFAULT 1,
     title         TEXT NOT NULL,
+    open_at       REAL NOT NULL DEFAULT 0,    -- 进入开放（可处理）状态的时间：升级计时起点（=创建时间）
     read_at       REAL,
     handled_at    REAL,
     handled_by    TEXT,
@@ -434,6 +447,10 @@ CREATE INDEX IF NOT EXISTS idx_approval_todos_node ON approval_todos(node_id);
 
 -- 外发通知（邮件/webhook）：每条待办按联系人启用通道生成；失败按指数退避重试
 -- （base*2^(attempts-1)，封顶），超过次数进 quarantine；待办关闭时未发出的投递取消。
+-- 聚合：group_id 非空表示该条已并入聚合组（held=窗口内暂缓，aggregated=已被摘要替代，
+-- 内容保留可查不再单独发送）；静默：delayed=静默时段内暂缓，delayed_until 记录预计
+-- 放行时间（时段变化/结束时由 worker 提前放行）。ordinal 为待办创建时的事件顺序号
+-- （= approval_todos.id），静默放行后按 (ordinal,id) 恢复原事件顺序发送。
 CREATE TABLE IF NOT EXISTS approval_notification_deliveries (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     todo_id       INTEGER NOT NULL REFERENCES approval_todos(id),
@@ -443,11 +460,14 @@ CREATE TABLE IF NOT EXISTS approval_notification_deliveries (
     subject       TEXT,
     body          TEXT,
     payload       TEXT,                       -- webhook 的 JSON 负载
-    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|sent|failed|quarantined|cancelled
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|sent|failed|quarantined|cancelled|held|aggregated|delayed
     attempts      INTEGER NOT NULL DEFAULT 0,
     next_retry_at REAL,
     last_error    TEXT,
     sent_at       REAL,
+    group_id      INTEGER,                       -- 所属聚合组（approval_notification_groups.id；该表后建，故不声明外键）
+    delayed_until REAL,
+    ordinal       INTEGER NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL
 );
@@ -455,6 +475,146 @@ CREATE INDEX IF NOT EXISTS idx_notif_deliveries_pick
     ON approval_notification_deliveries(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_notif_deliveries_todo
     ON approval_notification_deliveries(todo_id);
+CREATE INDEX IF NOT EXISTS idx_notif_deliveries_group
+    ON approval_notification_deliveries(group_id);
+CREATE INDEX IF NOT EXISTS idx_notif_deliveries_delayed
+    ON approval_notification_deliveries(status, delayed_until);
+
+-- 通知聚合规则：运营按接收人（NULL=全部）、来源批次（NULL=任意批次，指定批次时还可
+-- 配事件类型；不指定批次时为避免跨审批串扰，组仍按各自批次/变更单划分）、事件类型
+-- （NULL/空=全部）配置聚合窗口秒数。命中规则的通知，其邮件/webhook 在窗口内先 held，
+-- 窗口关闭时同组每个通道合并为一条摘要。站内待办不受规则影响，始终即时逐条生成。
+CREATE TABLE IF NOT EXISTS approval_aggregation_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient   TEXT,                         -- NULL/空=全体接收人
+    batch_id    INTEGER REFERENCES replay_batches(id),  -- NULL=任意来源批次（change 来源不按批次匹配）
+    event_type  TEXT,                         -- NULL/空=全部事件类型
+    window_seconds REAL NOT NULL,             -- 聚合窗口：首个事件落组后多少秒关闭
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_by  TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agg_rules_match
+    ON approval_aggregation_rules(active, recipient, batch_id, event_type);
+
+-- 聚合组：规则 + 接收人 + 通道 + 具体来源（批次/变更单）唯一。open=窗口开启中，
+-- flushed=已发出摘要，cancelled=窗口内来源全部落定、摘要不再需要。
+CREATE TABLE IF NOT EXISTS approval_notification_groups (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id      INTEGER NOT NULL REFERENCES approval_aggregation_rules(id),
+    recipient    TEXT NOT NULL,
+    channel      TEXT NOT NULL,
+    source_type  TEXT NOT NULL,               -- batch | change
+    batch_id     INTEGER,
+    change_id    INTEGER,
+    window_seconds REAL NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'open',  -- open|flushed|cancelled
+    window_opened_at REAL NOT NULL,
+    window_closes_at REAL NOT NULL,
+    flushed_at   REAL,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    UNIQUE (rule_id, recipient, channel, source_type, batch_id, change_id)
+);
+CREATE INDEX IF NOT EXISTS idx_notif_groups_pick
+    ON approval_notification_groups(status, window_closes_at);
+
+-- 聚合组成员：组内每个被暂缓的投递（held 的 delivery 行）与来源待办，用于生成摘要、
+-- 查询「哪些提醒被合并进了哪条摘要」；（组,投递）唯一兜底并发。
+CREATE TABLE IF NOT EXISTS approval_notification_group_members (
+    group_id    INTEGER NOT NULL REFERENCES approval_notification_groups(id),
+    delivery_id INTEGER NOT NULL REFERENCES approval_notification_deliveries(id),
+    todo_id     INTEGER NOT NULL REFERENCES approval_todos(id),
+    event_id    INTEGER NOT NULL REFERENCES approval_notify_events(id),
+    event_type  TEXT NOT NULL,
+    joined_at   REAL NOT NULL,
+    PRIMARY KEY (group_id, delivery_id)
+);
+CREATE INDEX IF NOT EXISTS idx_notif_group_members_todo
+    ON approval_notification_group_members(todo_id);
+
+-- 静默时段：每日重复（weekday_daily=1，start_time/end_time 为 UTC "HH:MM"，跨午夜表示
+-- 从前一日 start 到当日 end）或一次性（start_at/end_at epoch）。按接收人（NULL=全体）
+-- 与通道（NULL/空=邮件+webhook）匹配；窗内只保留站内待办，外发投递落 delayed，
+-- 时段结束按 ordinal（原事件顺序）放行。
+CREATE TABLE IF NOT EXISTS approval_quiet_schedules (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient    TEXT,                        -- NULL/空=全体接收人
+    channel      TEXT,                        -- NULL/空=email+webhook；否则 email|webhook
+    daily        INTEGER NOT NULL DEFAULT 1,  -- 1=每日重复（UTC）；0=一次性
+    start_time   TEXT,                        -- daily=1：开始 "HH:MM"（UTC）
+    end_time     TEXT,                        -- daily=1：结束 "HH:MM"（UTC，可小于 start 表示跨午夜）
+    start_at     REAL,                        -- daily=0：一次性开始
+    end_at       REAL,                        -- daily=0：一次性结束
+    active       INTEGER NOT NULL DEFAULT 1,
+    created_by   TEXT NOT NULL,
+    note         TEXT,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quiet_schedules_match
+    ON approval_quiet_schedules(active, recipient, channel);
+
+-- 升级策略：按节点角色（roles JSON，'any' 匹配通配节点；change 来源的待办可配
+-- role='change'）逐级配置升级接收人与触发时限（after_seconds=待办生成后 N 秒，或
+-- before_deadline_seconds=截止前 N 秒）。多条策略可同时命中，每级各自触发。
+CREATE TABLE IF NOT EXISTS approval_escalation_policies (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    roles       TEXT NOT NULL DEFAULT '[]',   -- JSON 角色数组（含 'any' 时匹配通配节点；'change' 匹配变更单）
+    levels_json TEXT NOT NULL,                -- [{"recipients":[...], "after_seconds":N|null,
+                                              --  "before_deadline_seconds":N|null}]，级别即下标+1
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_by  TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_escalation_policies_match
+    ON approval_escalation_policies(active);
+
+-- 升级记录：同一来源（节点/变更单）的同一原始接收人在每个命中策略下至多一条链
+-- （UNIQUE(policy_id, source_key, base_recipient)：该接收人在节点上可能同时有
+-- activated/deadline 等多个可操作待办，只升级一次，不重复提醒）。base_todo_id 锚定
+-- 该接收人最早的开放待办（计时起点）。fired=已发出升级通知；stopped=原接收人已处理
+-- 或来源落定，后续级别不再触发且未发出的升级投递取消；levels_fired 记录已发级别。
+CREATE TABLE IF NOT EXISTS approval_escalations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_id    INTEGER NOT NULL REFERENCES approval_escalation_policies(id),
+    base_todo_id INTEGER NOT NULL REFERENCES approval_todos(id),
+    base_recipient TEXT NOT NULL,            -- 原始接收人（链按 来源+接收人 去重）
+    source_key   TEXT NOT NULL,              -- 'node:{id}' | 'change:{id}'
+    source_type  TEXT NOT NULL,
+    batch_id     INTEGER,
+    change_id    INTEGER,
+    node_id      INTEGER,
+    levels_total INTEGER NOT NULL,
+    levels_fired INTEGER NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending|firing|stopped
+    stop_reason  TEXT,                        -- handled|source_closed
+    stopped_at   REAL,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    UNIQUE (policy_id, source_key, base_recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_escalations_status ON approval_escalations(status);
+CREATE INDEX IF NOT EXISTS idx_escalations_todo ON approval_escalations(base_todo_id);
+
+-- 已触发的升级级别：关联升级事件生成的待办，停止升级时据此取消其未发出投递。
+-- （策略,原始待办,级别）唯一：同一级别的升级通知绝不发第二次。
+CREATE TABLE IF NOT EXISTS approval_escalation_levels (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    escalation_id  INTEGER NOT NULL REFERENCES approval_escalations(id),
+    policy_id      INTEGER NOT NULL REFERENCES approval_escalation_policies(id),
+    base_todo_id   INTEGER NOT NULL REFERENCES approval_todos(id),
+    level          INTEGER NOT NULL,
+    recipients     TEXT NOT NULL,             -- JSON 该级接收人快照
+    notify_event_id INTEGER REFERENCES approval_notify_events(id),
+    fired_at       REAL NOT NULL,
+    UNIQUE (policy_id, base_todo_id, level)
+);
+CREATE INDEX IF NOT EXISTS idx_escalation_levels_esc
+    ON approval_escalation_levels(escalation_id);
 """
 
 
@@ -608,6 +768,39 @@ class Database:
                 self._conn.execute(
                     "ALTER TABLE replay_approval_nodes ADD COLUMN "
                     "required_approvals INTEGER NOT NULL DEFAULT 1")
+        # 通知聚合/静默/升级：老库补列（新库由 SCHEMA 直接建出完整结构，自动跳过）
+        if "approval_notification_deliveries" in tables:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(approval_notification_deliveries)")}
+            if "group_id" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE approval_notification_deliveries ADD COLUMN group_id INTEGER")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_notif_deliveries_group "
+                    "ON approval_notification_deliveries(group_id)")
+            if "delayed_until" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE approval_notification_deliveries "
+                    "ADD COLUMN delayed_until REAL")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_notif_deliveries_delayed "
+                    "ON approval_notification_deliveries(status, delayed_until)")
+            if "ordinal" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE approval_notification_deliveries "
+                    "ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0")
+                # 存量投递按投递 id 恢复事件顺序（与待办创建顺序一致）
+                self._conn.execute(
+                    "UPDATE approval_notification_deliveries SET ordinal=id WHERE ordinal=0")
+        if "approval_todos" in tables:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(approval_todos)")}
+            if "open_at" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE approval_todos ADD COLUMN open_at REAL NOT NULL DEFAULT 0")
+                # 存量待办的升级计时起点取创建时间
+                self._conn.execute(
+                    "UPDATE approval_todos SET open_at=created_at WHERE open_at=0")
 
     @contextmanager
     def tx(self):

@@ -28,6 +28,9 @@
                 │   节点激活/投票/临期/拒绝/超时/策略变更 -> 站内待办       │
                 │   邮件 + webhook 双通道；指数退避重试，超限隔离          │
                 │   待办处理回写原审批动作（重复/过期/并发不重复投票）      │
+                │   通知聚合：按接收人/批次/事件类型配窗口，重复提醒合并摘要 │
+                │   静默时段：窗内只留站内待办，邮件/webhook 延迟后按序发送  │
+                │   升级策略：按角色逐级升级、记录级别，原接收人处理即停止   │
                 │   审批委托（生效/失效/撤销/再激活）                      │
                 │     /admin/replay-delegations/*                      │
                 │   重放副作用走同一 outbox 幂等链路                     │
@@ -92,6 +95,13 @@
 | 处理待办回写原审批动作且防重复/防过期/防并发 | 认领与原决定（`decide_node_tx`/`decide_change_tx`）同一写事务；重复点击/过期/并发均 409，不重复投票、不越过门禁 |
 | 待办看板与多维度查询 | `GET .../summary`（未读/已读/已处理/过期/取消 + 失败/隔离）；`GET .../todos` 按接收人/来源/节点/状态过滤 |
 | 通知全链路审计 | 生成/发送/重试/隔离/确认/回写/关闭均落 `events`（`approval_*` 类型，独立 detail 键不污染批次时间线） |
+| 重复提醒按窗口聚合为一条摘要 | `approval_aggregation_rules`（接收人/来源批次/事件类型 + 窗口秒数）：命中的邮件/webhook 窗口内 `held` 入 `approval_notification_groups`，窗口关闭每通道合并一条摘要（webhook 负载含全部成员，按原事件顺序），成员置 `aggregated` 保留可查；站内待办始终即时逐条生成，见 `app/notif_policy.py` |
+| 静默时段只留站内待办、外发延迟并按原顺序发送 | `approval_quiet_schedules`（每日 UTC 重复/一次性、可按接收人与通道）：窗内外发落 `delayed`，站内待办不受影响；时段结束 worker 按 `(ordinal,id)`（=待办创建顺序）放回发送队列；计划停用立即放行；静默结束前待办已关闭则取消不补发 |
+| 临期未处理按角色逐级升级、记录级别 | `approval_escalation_policies`（角色 + 逐级接收人，`after_seconds` 待办生成后 / `before_deadline_seconds` 截止前触发）：按「来源节点/变更单 + 原始接收人」去重，每级一条 `escalated` 可操作待办与 `approval_escalation_levels` 记录；重复扫描/重启/并发不重发（唯一约束 + 条件状态转移） |
+| 原接收人处理后升级通知必须停止 | 待办处理/对账关闭/联系人停用在同一写事务调用 `stop_escalations_for_todo_tx`：升级链落 `stopped`（原因 handled/source_closed）、后续级别不再触发、已升级别未发出投递（pending/failed/held/delayed）同事务取消；已发出外部效果轨迹保留 |
+| 聚合/延迟/升级/取消/恢复可查询 | `GET .../aggregation-rules`、`.../aggregation-groups`（组状态+成员+摘要投递）、`.../quiet-schedules`、`.../escalation-policies`、`.../escalations`（每级触发时间/接收人/停止原因）；待办视图内嵌 held/delayed 通道与升级链，看板增加 held/delayed/aggregated 计数 |
+| 聚合/延迟/升级/取消/恢复全程审计 | `approval_delivery_held`、`approval_aggregation_group_flushed/cancelled`、`approval_delivery_delayed/released`、`approval_escalation_armed/fired/stopped`、各配置 `_set` 事件全部落 `events` |
+| 重启/重复事件/并发扫描不重发不漏发 | 所有状态转移为写事务内条件 UPDATE + 唯一索引（组、升级链、级别、事件 event_key、待办 event+recipient）；worker 步骤序：静默放行→截止提醒→对账→升级扫描→聚合刷新→投递；通道 IO 在事务外，崩溃重启后从库内状态继续 |
 | Docker 部署 | `Dockerfile` + `docker-compose.yml` |
 
 ## 快速开始
@@ -105,7 +115,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 159 个端到端测试
+python -m pytest tests/          # 182 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -652,6 +662,135 @@ curl -X POST localhost:8000/admin/approval-notifications/todos/12/act \
   不进入重放批次按 `replay_batch_id` 过滤的审计时间线。
 
 
+## 通知聚合、静默时段与升级策略
+
+在上述通知链路之上，运营可以配置**聚合窗口、静默时段与逐级升级**（`app/notif_policy.py`）。
+三者只作用于外发通道（邮件/webhook）的「何时、以什么形态发出」与升级接收人，
+**站内待办始终即时、逐条生成**——任何策略都不会吞掉或延迟关键审批待办。
+
+### 1. 通知聚合
+
+按**接收人、来源批次、事件类型**配置聚合窗口；窗口内同组（规则+接收人+通道+同一
+批次/变更单）的重复提醒先 `held` 入组，窗口关闭时每个通道合并为**一条摘要**：
+
+```bash
+# 批次 7 内 LEAD_A 的全部外发提醒，60 秒内合并
+curl -X POST localhost:8000/admin/approval-notifications/aggregation-rules \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","recipient":"ops-wang","batch_id":7,
+       "window_seconds":60}'
+# -> {"result":"created","rule_id":1}
+
+# 省略 recipient=全体；省略 event_type=全部事件类型；省略 batch_id=任意来源
+# （不指定批次时组仍按各自批次/变更单划分，不跨审批串扰）
+curl -X POST localhost:8000/admin/approval-notifications/aggregation-rules \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","event_type":"vote_received","window_seconds":120}'
+
+curl localhost:8000/admin/approval-notifications/aggregation-rules
+curl 'localhost:8000/admin/approval-notifications/aggregation-groups?batch_id=7'
+# 组视图：open/flushed/cancelled + 成员明细 + 摘要投递 id/状态
+curl -X POST localhost:8000/admin/approval-notifications/aggregation-rules/1/active \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-admin","active":false}'
+```
+
+- 窗口内：站内待办照常生成（可立即处理），邮件/webhook 为 `held`（待办视图的
+  `held_channels`、投递行的 `group_id` 可查）；窗口关闭：成员投递置 `aggregated`
+  （内容保留可查），另发一条摘要——邮件为合并正文，webhook 负载
+  `event=aggregated_digest`，`items[]` 按原事件顺序列出每条被合并提醒。
+- 窗口内来源全部落定（成员待办都已处理/取消/过期）的组直接 `cancelled`，不再外发摘要。
+- 摘要本身同样受静默时段约束（静默中则延迟到时段结束发送）。
+
+### 2. 静默时段
+
+按**接收人/通道**配置**每日重复（UTC，支持跨午夜）**或**一次性**时间窗。窗内
+**只保留站内待办**，邮件/webhook 落 `delayed`；时段结束后按**原事件顺序**发送：
+
+```bash
+# 一次性静默（epoch 秒或带时区 ISO-8601）：今晚 22:00-次日 08:00 全体、双通道
+curl -X POST localhost:8000/admin/approval-notifications/quiet-schedules \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","daily":false,
+       "start_at":"2026-09-12T22:00:00Z","end_at":"2026-09-13T08:00:00Z"}'
+
+# 每日重复（UTC）：ops-wang 每晚 22:00 到次日 02:00 只静默 webhook（email 照发）
+curl -X POST localhost:8000/admin/approval-notifications/quiet-schedules \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","recipient":"ops-wang","channel":"webhook",
+       "daily":true,"start_time":"22:00","end_time":"02:00"}'
+
+curl localhost:8000/admin/approval-notifications/quiet-schedules
+# 停用计划：下一轮 worker 立即放行（不必等到 end_at）
+curl -X POST localhost:8000/admin/approval-notifications/quiet-schedules/1/active \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-admin","active":false}'
+```
+
+- 每条投递记 `delayed_until`；放行按 `(ordinal,id)` 排序，`ordinal`=待办创建顺序，
+  因此严格「按原事件顺序」到达邮件/webhook；多个重叠窗口取最晚结束时间。
+- 静默期间待办已被处理/取消的，放行时该投递直接 `cancelled`，不补发已过时提醒；
+  发送失败仍走既有指数退避/隔离链路。
+
+### 3. 升级策略
+
+按**节点角色**（`'any'` 匹配通配节点，`'change'` 匹配策略变更单）配置**逐级
+升级接收人**与触发时限：`after_seconds`（待办生成后 N 秒）或
+`before_deadline_seconds`（截止前 N 秒），可只填其一，级别按 after 单调递增。
+
+```bash
+# ops-lead 节点：10 分钟未处理升级给值班经理，30 分钟未处理再升级给 VP
+curl -X POST localhost:8000/admin/approval-notifications/escalation-policies \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","name":"lead-escalation","roles":["ops-lead"],
+       "levels":[
+         {"recipients":["oncall-mgr"],"after_seconds":600},
+         {"recipients":["vp-zhang"],"after_seconds":1800}]}'
+
+# 也可按截止时间：距截止 10 分钟升级
+curl -X POST localhost:8000/admin/approval-notifications/escalation-policies \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","name":"deadline-escalation","roles":["any"],
+       "levels":[{"recipients":["oncall-mgr"],"before_deadline_seconds":600}]}'
+
+curl localhost:8000/admin/approval-notifications/escalation-policies
+curl 'localhost:8000/admin/approval-notifications/escalations?batch_id=7'
+```
+
+- 升级去重单元是 **(策略, 来源节点/变更单, 原始接收人)**：同一接收人在节点上的
+  激活/投票/临期多个待办只产生**一条升级链**；每个级别至多一条 `escalated`
+  待办（升级接收人同样是可操作待办，回写仍走原审批门禁——指定角色节点须凭本人
+  当前有效委托，不绕过任何角色/职责分离/状态检查）。
+- 每级触发、接收人、时间落 `approval_escalation_levels`，列表与待办视图
+  （`escalation` 字段）可见级别进度。
+- **原接收人处理后升级立即停止**：待办处理（handled）、来源落定（节点批准/拒绝/
+  超时/撤回、变更单落定）、联系人停用都在同一写事务把升级链置 `stopped`
+  （原因 `handled`/`source_closed`），后续级别不再触发，已升级别**尚未发出**的
+  邮件/webhook（含聚合 held、静默 delayed）同事务取消；已发出的外部效果无法撤回，
+  轨迹保留可查。
+
+### 4. worker 顺序、可靠性与审计
+
+通知 worker 每轮顺序固定：**静默放行 → 截止提醒扫描 → 待办对账 → 升级扫描 →
+聚合窗口刷新 → 外发投递**。所有状态转移都是写事务（`BEGIN IMMEDIATE`，全局串行）
+内的条件 UPDATE 加唯一约束（聚合组、升级链、升级级别、事件 `event_key`、
+待办 `event+recipient`），通道 IO 在事务外：
+
+- 服务重启后从库内状态继续：开放的聚合组到期即 flush、delayed 到期即放行、
+  到期级别即触发，已 flushed/flushed/fired 的记录被条件更新挡下，**不重复发送**；
+- 重复事件（同一 event_key）、并发 worker 扫描只可能有一个赢家；
+- 聚合窗口与静默叠加时：窗口内 held → 窗口关闭生成摘要，若仍在静默窗则摘要
+  delayed，时段结束按序发送，两个维度都不漏不重。
+
+审计事件（`GET /admin/events`）：
+
+| 阶段 | 事件类型 |
+|---|---|
+| 聚合 | `approval_delivery_held`、`approval_aggregation_group_flushed`、`approval_aggregation_group_cancelled`、`approval_aggregation_rule_set` |
+| 静默 | `approval_delivery_delayed`、`approval_delivery_released`、`approval_quiet_schedule_set`（静默中待办关闭而取消补发为 `approval_delivery_cancelled`） |
+| 升级 | `approval_escalation_armed`、`approval_escalation_fired`、`approval_escalation_stopped`、`approval_escalation_policy_set` |
+
+看板 `GET .../summary` 增加 `delivery_held`/`delivery_delayed`/
+`delivery_aggregated`/`delivery_pending`/`delivery_sent` 计数（均可按接收人过滤）。
+
 
 ## 配置（环境变量）
 
@@ -710,3 +849,9 @@ curl -X POST localhost:8000/admin/approval-notifications/todos/12/act \
   补 `policy_lane`/`rollout_id`/`rollout_seq` 列与 `replay_policy_stable`/
   `replay_policy_releases` 表：已有 applied 策略时按最近版本为每个风险等级回填稳定
   指针（行为与升级前一致），从未提交过策略则继续走内置默认；老批次一律视为稳定车道。
+  聚合/静默/升级功能再打开时新建 `approval_aggregation_rules`、
+  `approval_notification_groups(_members)`、`approval_quiet_schedules`、
+  `approval_escalation_policies`、`approval_escalations(_levels)` 表，
+  并给 `approval_notification_deliveries` 补 `group_id`/`delayed_until`/`ordinal`
+  列（存量投递的 ordinal 回填为投递 id）、给 `approval_todos` 补 `open_at`
+  （回填为 created_at）；升级前不存在规则/计划/策略，存量通知行为与升级前完全一致。
