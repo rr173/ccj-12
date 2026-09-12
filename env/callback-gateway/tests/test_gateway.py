@@ -289,3 +289,70 @@ def test_manual_resolution_resumes_and_is_audited(client):
     assert resolved["detail"]["operator"] == "ops-wang"
     effect_events = client.get("/admin/events", params={"type": "effect_executed"}).json()["events"]
     assert len(effect_events) == 1  # 只有被选中的版本产生了副作用
+
+
+def test_unselected_done_version_effect_cancelled_after_resolution(tmp_path):
+    """旧版本已处理完成（副作用滞留 outbox 未派发）后收到新版本：
+    人工选定新版本后，只有新版本产生外部效果，旧版本滞留的副作用被取消。"""
+    app = make_app(tmp_path)
+    with TestClient(app) as c:
+        post(c, "X-1", b'{"order": 1, "amount": 100}')
+        worker = c.app.state.worker
+        worker._process_due()  # 旧版本处理完成，副作用落 outbox 但尚未派发
+
+        r = post(c, "X-1", b'{"order": 1, "amount": 200}')
+        conflict_id = r.json()["conflict_id"]
+        versions = c.get(f"/admin/conflicts/{conflict_id}").json()["versions"]
+        v1 = next(v for v in versions if "100" in v["payload"])
+        v2 = next(v for v in versions if "200" in v["payload"])
+
+        r = c.post(f"/admin/conflicts/{conflict_id}/resolve",
+                   json={"delivery_id": v2["id"], "operator": "ops-wang"})
+        assert r.json()["result"] == "resolved"
+
+        worker.run_once()  # 处理新版本 + 派发
+
+        db = c.app.state.db
+        # 下游只应用了新版本的副作用
+        applied = db.query("SELECT * FROM sink_effects")
+        assert len(applied) == 1
+        assert "200" in applied[0]["payload"]
+        # 旧版本滞留的 outbox 行被取消，不再参与派发
+        v1_outbox = db.query_one("SELECT * FROM outbox WHERE delivery_id=?", (v1["id"],))
+        assert v1_outbox["status"] == "cancelled"
+        # 取消动作有审计
+        cancelled = c.get("/admin/events", params={"type": "effect_cancelled"}).json()["events"]
+        assert len(cancelled) == 1
+        assert cancelled[0]["delivery_id"] == v1["id"]
+
+        # 再跑 worker 也不会有第二次效果
+        worker.run_once()
+        assert db.query_one("SELECT COUNT(*) AS c FROM sink_effects")["c"] == 1
+
+
+def test_frozen_group_effects_paused_until_resolved(tmp_path):
+    """冲突冻结期间，已完成版本滞留的副作用暂停派发；
+    若人工选定的恰是该版本，解冻后其副作用恢复派发。"""
+    app = make_app(tmp_path)
+    with TestClient(app) as c:
+        post(c, "X-2", b'{"order": 2, "amount": 100}')
+        worker = c.app.state.worker
+        worker._process_due()  # v1 done，副作用滞留 outbox
+
+        r = post(c, "X-2", b'{"order": 2, "amount": 200}')
+        conflict_id = r.json()["conflict_id"]
+
+        # 冻结期间：派发器不动该组的滞留副作用
+        worker._dispatch_outbox()
+        db = c.app.state.db
+        assert db.query_one("SELECT COUNT(*) AS c FROM sink_effects")["c"] == 0
+
+        # 人工选定旧版本 v1 -> 解冻后其滞留副作用恢复派发
+        versions = c.get(f"/admin/conflicts/{conflict_id}").json()["versions"]
+        v1 = next(v for v in versions if "100" in v["payload"])
+        c.post(f"/admin/conflicts/{conflict_id}/resolve",
+               json={"delivery_id": v1["id"], "operator": "ops-wang"})
+        worker.run_once()
+        applied = db.query("SELECT * FROM sink_effects")
+        assert len(applied) == 1
+        assert "100" in applied[0]["payload"]

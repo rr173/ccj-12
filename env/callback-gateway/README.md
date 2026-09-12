@@ -31,6 +31,7 @@
 | 失败按间隔重试、连续失败隔离、不堵别的编号 | 指数退避 `base*2^(n-1)`；超限 `quarantined`；worker 按条拉取，隔离只影响该条，见 `app/worker.py` |
 | 重启/重复投递副作用不做两次 | outbox 幂等键 + 派发前检查下游是否已应用该键，见 `app/worker.py`、`app/handlers.py` |
 | 人工选定后从可追溯位置继续 | 选定版本保留 `checkpoint` 与 `attempts` 历史，解冻续跑；全程写 `events` 审计 |
+| 只有被选中的版本继续产生外部效果 | 派发器只发「done 且未冻结」版本的 outbox；处置时未选中版本滞留的待派发副作用同事务取消（`cancelled`）并记审计，见 `app/worker.py`、`app/admin.py` |
 | 查询签名/冲突/重试/处置记录 | `GET /admin/events`（只增不删的审计表） |
 | Docker 部署 | `Dockerfile` + `docker-compose.yml` |
 
@@ -116,4 +117,7 @@ curl 'localhost:8000/admin/events?external_id=A-1001'
   「带 `Idempotency-Key` 头的 HTTP 调用」即可。
 - **可追溯续跑**：每条 delivery 带 `checkpoint`（JSON 位置快照）和完整 `attempts` 历史；
   人工选定版本后从该位置继续，每一步都落在 `events` 审计表。
+- **只有被选中的版本产生外部效果**：冲突冻结期间整组的待派发副作用暂停；
+  人工选定后，未选中版本滞留在 outbox 的副作用在同一事务里置为 `cancelled`
+  （内容保留可查），派发器只放行「done 且未冻结」版本——旧版本不会再对外产生效果。
 - **隔离不蔓延**：隔离是 per-delivery 的状态，worker 拉取时天然跳过，其他编号照常处理。

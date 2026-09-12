@@ -124,6 +124,17 @@ def create_admin_router(db: Database) -> APIRouter:
                            WHERE id=? AND status IN ('pending','conflicted','quarantined')""",
                         (now, mid),
                     )
+                    # 未选中版本滞留的待派发副作用一并取消（同事务），
+                    # 保证只有被选中的版本会继续产生外部效果
+                    cancelled = cur.execute(
+                        "UPDATE outbox SET status='cancelled' "
+                        "WHERE delivery_id=? AND status='pending'",
+                        (mid,),
+                    ).rowcount
+                    if cancelled:
+                        audit.record(cur, "effect_cancelled", conflict["external_id"], mid,
+                                     {"conflict_id": conflict_id, "cancelled": cancelled,
+                                      "reason": "version_not_selected"}, ts=now)
             resolution = {"chosen_delivery_id": req.delivery_id,
                           "operator": req.operator, "note": req.note}
             cur.execute(

@@ -138,16 +138,32 @@ class Worker:
 
     # ---- 副作用派发（outbox） -------------------------------------------
 
+    # 只有「已处理完成且未被冻结」的版本才允许产生外部效果：
+    # 冲突冻结期间整组暂停派发；人工选定后未选中版本被 superseded/cancelled，
+    # 其滞留的副作用永不再发 —— 只有被选中的版本继续执行。
+    _DISPATCHABLE_SQL = """
+        SELECT o.* FROM outbox o
+        JOIN deliveries d ON d.id = o.delivery_id
+        WHERE o.status='pending' AND d.frozen=0 AND d.status='done'
+        ORDER BY o.id LIMIT 100"""
+
     def _dispatch_outbox(self):
-        rows = self.db.query(
-            "SELECT * FROM outbox WHERE status='pending' ORDER BY id LIMIT 100"
-        )
+        rows = self.db.query(self._DISPATCHABLE_SQL)
         for row in rows:
             self._dispatch_one(row)
 
     def _dispatch_one(self, row):
         now = self.clock()
         key = row["idempotency_key"]
+        # 发送前复查：拉取之后行可能已被人工处置取消，或所属版本被冻结/取代
+        still_valid = self.db.query_one(
+            """SELECT 1 AS x FROM outbox o
+               JOIN deliveries d ON d.id = o.delivery_id
+               WHERE o.id=? AND o.status='pending' AND d.frozen=0 AND d.status='done'""",
+            (row["id"],),
+        )
+        if still_valid is None:
+            return
         try:
             # 重启恢复的关键：下游若已应用过该幂等键，直接标记执行完毕，绝不再发
             if not self.sink.already_applied(key):

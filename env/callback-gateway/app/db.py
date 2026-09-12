@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     effect_type     TEXT NOT NULL,
     idempotency_key TEXT NOT NULL UNIQUE,      -- 幂等键：重启/重复投递不重复执行
     payload         TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending',  -- pending|executed|failed
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending|executed|failed|cancelled（人工未选中而取消）
     attempts        INTEGER NOT NULL DEFAULT 0,
     executed_at     REAL,
     created_at      REAL NOT NULL
