@@ -7,6 +7,11 @@
   与批次规模（min_size/max_size，任务条数）匹配，声明一串审批节点：
   mode=serial 时节点串行（上一节点满足后才激活下一节点，各自起算截止时间），
   mode=parallel 时节点并行（同时待决，全部满足才放行）；
+- 每个节点可配置：允许承担该节点的角色（role 单角色，或 roles 角色列表；
+  'any' 表示任何非发起人）与法定人数 required_approvals（有效赞成票达到该数
+  节点才满足，默认 1）。串行节点按节点分别计数、逐节点满足；并行节点各自达到
+  法定人数才算满足。审批人凭本人当前有效的角色委托（见 delegation.py）承担
+  指定角色，或在直接持角色场景下不带委托承担；
 - 提交重放批次时按「当前生效策略 + 批次风险等级 + 批次规模」解析出节点链，
   节点行与策略快照随批次一次性落盘——之后策略再更新也不影响已提交的批次；
 - 没有任何已生效策略时使用内置默认策略（与引入策略功能前的行为一致）：
@@ -42,7 +47,8 @@ def builtin_default_rules(approval_timeout_seconds: float) -> list[dict]:
     return [
         {"name": "builtin-high-risk-single-approval", "risk_level": "high",
          "min_size": None, "max_size": None, "mode": "serial",
-         "nodes": [{"role": ROLE_ANY, "timeout_seconds": float(approval_timeout_seconds)}]},
+         "nodes": [{"role": ROLE_ANY, "required_approvals": 1,
+                    "timeout_seconds": float(approval_timeout_seconds)}]},
         {"name": "builtin-normal-no-approval", "risk_level": "normal",
          "min_size": None, "max_size": None, "mode": "serial", "nodes": []},
     ]
@@ -89,17 +95,46 @@ def validate_policy(doc) -> tuple[list[dict] | None, list[str]]:
             if not isinstance(node, dict):
                 errors.append(f"rules[{i}].nodes[{j}]: must be an object")
                 continue
+            # 允许承担该节点的角色：role 单角色，或 roles 角色列表（至少一个）；
+            # role 缺省时取 roles[0]，两者都给时取并集（role 不得与 roles 矛盾）
             role = node.get("role")
-            if not isinstance(role, str) or not role.strip():
-                errors.append(f"rules[{i}].nodes[{j}].role: must be a non-empty string")
-                role = ""
+            roles = node.get("roles")
+            allowed: list[str] = []
+            if isinstance(roles, list) and roles:
+                for r in roles:
+                    if not isinstance(r, str) or not r.strip():
+                        errors.append(
+                            f"rules[{i}].nodes[{j}].roles: each role must be a non-empty string")
+                    elif r.strip() not in allowed:
+                        allowed.append(r.strip())
+            elif roles is not None:
+                errors.append(
+                    f"rules[{i}].nodes[{j}].roles: must be a non-empty list when present")
+            if role is not None:
+                if not isinstance(role, str) or not role.strip():
+                    errors.append(f"rules[{i}].nodes[{j}].role: must be a non-empty string")
+                elif role.strip() not in allowed:
+                    allowed.insert(0, role.strip())
+            if not allowed:
+                errors.append(
+                    f"rules[{i}].nodes[{j}]: role or roles must designate at least one role")
+            primary = (role.strip() if isinstance(role, str) and role.strip()
+                       else (allowed[0] if allowed else ""))
             timeout = node.get("timeout_seconds")
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
                     or timeout <= 0:
                 errors.append(
                     f"rules[{i}].nodes[{j}].timeout_seconds: must be a positive number")
                 timeout = 0
-            norm_nodes.append({"role": role.strip(), "timeout_seconds": float(timeout)})
+            required = node.get("required_approvals", 1)
+            if isinstance(required, bool) or not isinstance(required, int) \
+                    or required < 1:
+                errors.append(
+                    f"rules[{i}].nodes[{j}].required_approvals: must be an integer >= 1")
+                required = 1
+            norm_nodes.append({"role": primary, "roles": allowed,
+                               "required_approvals": required,
+                               "timeout_seconds": float(timeout)})
         normalized.append({
             "name": name.strip() if isinstance(name, str) and name.strip() else f"rule-{i}",
             "risk_level": risk,

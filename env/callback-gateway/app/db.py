@@ -15,9 +15,15 @@
                    带版本时间快照（同编号有序执行的排序键）与最近阻塞原因（审计去重用）
 - replay_policy_versions  审批策略每次变更/尝试的记录（版本、操作者、时间、结果）；
                     提交批次时按当前生效策略生成审批节点，已提交批次不受后续变更影响
-- replay_approval_nodes   批次的多级审批节点：指定角色、实际审批人、截止时间；
-                    串行链逐节点激活，并行节点同时待决；任一拒绝/超时终止批次，
-                    全部批准（或跳过）后批次才进入 running
+- replay_approval_nodes   批次的多级审批节点：允许承担的角色列表、法定人数
+                    （required_approvals）、实际审批人、截止时间；串行链逐节点激活，
+                    并行节点同时待决；节点有效赞成票达到法定人数才满足，任一拒绝/
+                    超时终止批次，全部满足后批次才进入 running
+- replay_node_votes       节点上的每一票（赞成/拒绝/跳过）：实际承担角色与所用委托；
+                    同一节点同一人只保留一张有效票（部分唯一索引），同一批次同一人
+                    不能在多个节点持有效票；委托在节点满足前失效/撤销时其票置为无效
+- replay_delegations      审批委托：运营把某角色在生效/失效时间窗内委托给受托人，
+                    可撤销、重新激活；到期由 worker 扫描失效，节点决定时必须仍有效
 """
 from __future__ import annotations
 
@@ -170,15 +176,19 @@ CREATE TABLE IF NOT EXISTS replay_policy_versions (
 -- 批次的多级审批节点：提交时按策略快照一次性生成，之后不随策略变更而改变。
 -- 串行链：只有当前节点 active，上一节点满足后才激活下一节点（激活时才起算截止时间）；
 -- 并行：所有节点同时 active，全部满足才放行。任一节点拒绝/超时即终止整个批次。
+-- 一个节点可有多个允许角色（allowed_roles JSON），required_approvals 为该节点法定
+-- 人数：有效赞成票达到法定人数节点才满足（串行/并行都按节点分别计数）。
 CREATE TABLE IF NOT EXISTS replay_approval_nodes (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id     INTEGER NOT NULL REFERENCES replay_batches(id),
     seq          INTEGER NOT NULL,          -- 链内顺序（0 起）
-    role         TEXT NOT NULL,             -- 指定审批角色（'any' 表示任何非发起人）
+    role         TEXT NOT NULL,             -- 主指定角色（与 allowed_roles[0] 一致；'any' 表示任何非发起人）
+    allowed_roles TEXT NOT NULL DEFAULT '["any"]',  -- 允许承担该节点的角色列表（JSON）
+    required_approvals INTEGER NOT NULL DEFAULT 1,  -- 法定人数：有效赞成票达到此数节点才满足
     status       TEXT NOT NULL DEFAULT 'waiting',  -- waiting|active|approved|rejected|skipped|expired|cancelled
     timeout_seconds REAL NOT NULL,          -- 本节点审批时限（激活时起算）
-    decided_by   TEXT,                      -- 实际审批人（决定后落库，永不改写）
-    decided_role TEXT,                      -- 审批人实际承担的角色
+    decided_by   TEXT,                      -- 使节点落定（达到法定人数/拒绝/跳过）的最后决定人（兼容展示，永不改写）
+    decided_role TEXT,                      -- 该决定人实际承担的角色
     decision_reason TEXT,                   -- 拒绝/跳过原因（这两类决定必填）
     decision_note TEXT,                     -- 决定备注
     activated_at REAL,                      -- 节点进入待决的时间
@@ -189,6 +199,53 @@ CREATE TABLE IF NOT EXISTS replay_approval_nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_replay_approval_nodes_batch ON replay_approval_nodes(batch_id, status);
 CREATE INDEX IF NOT EXISTS idx_replay_approval_nodes_due ON replay_approval_nodes(status, deadline);
+
+-- 审批委托：运营（operator）把某个审批角色（role）在 [valid_from, valid_to] 时间窗内
+-- 委托给受托人（delegatee）。决定时受托人凭有效委托承担该角色；委托撤销/到期后，
+-- 其投在尚未满足的节点上的票随之失效（已满足/落定节点不被改写）。
+CREATE TABLE IF NOT EXISTS replay_delegations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    role        TEXT NOT NULL,              -- 被委托的审批角色
+    delegatee   TEXT NOT NULL,              -- 受托人（凭委托承担该角色的运营人员）
+    delegator   TEXT NOT NULL,              -- 委托人/创建人（授予角色权力的运营人员）
+    status      TEXT NOT NULL DEFAULT 'active',  -- active|revoked（到期由扫描改写为 expired）
+    valid_from  REAL NOT NULL,
+    valid_to    REAL NOT NULL,
+    note        TEXT,
+    revoked_at  REAL,
+    revoked_by  TEXT,
+    revoke_reason TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_replay_delegations_role ON replay_delegations(role, status);
+CREATE INDEX IF NOT EXISTS idx_replay_delegations_due ON replay_delegations(status, valid_to);
+
+-- 节点上的每一票。approve 票在委托失效/撤销后可能置为 invalid（节点尚未满足时）；
+-- reject/skip 票一投即让节点落定（拒绝还会终止整个批次），始终保持 valid 不可改写。
+-- 同一节点同一人至多一张有效票（防重复计数/并发重复决定）；同一批次同一人不能在
+-- 多个节点持有效票（不能在同一批次承担多个节点）。
+CREATE TABLE IF NOT EXISTS replay_node_votes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id       INTEGER NOT NULL REFERENCES replay_approval_nodes(id),
+    batch_id      INTEGER NOT NULL REFERENCES replay_batches(id),
+    vote          TEXT NOT NULL,            -- approve|reject|skip
+    voter         TEXT NOT NULL,            -- 实际投票人
+    voter_role    TEXT NOT NULL,            -- 投票人实际承担的角色（与节点允许角色一致）
+    delegation_id INTEGER REFERENCES replay_delegations(id),  -- 所用委托；NULL=直接持角色承担
+    status        TEXT NOT NULL DEFAULT 'valid',  -- valid|invalid（仅 approve 票可能失效）
+    reason        TEXT,
+    note          TEXT,
+    created_at    REAL NOT NULL,
+    invalidated_at REAL
+);
+-- 同一节点同一人：最多一张有效票（失效后可以重新投票）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_replay_votes_node_voter_valid
+    ON replay_node_votes(node_id, voter) WHERE status='valid';
+-- 同一批次同一人：最多在一个节点持有效票（不能承担多个节点）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_replay_votes_batch_voter_valid
+    ON replay_node_votes(batch_id, voter) WHERE status='valid';
+CREATE INDEX IF NOT EXISTS idx_replay_votes_node ON replay_node_votes(node_id, status);
 """
 
 
@@ -206,6 +263,7 @@ class Database:
             self._migrate()   # 先补旧库的列，再建表（SCHEMA 里的索引依赖新列）
             self._conn.executescript(SCHEMA)
             self._migrate_pending_approval_nodes()   # 依赖新表，必须在 SCHEMA 之后
+            self._migrate_node_votes()               # 法定人数/投票：回填老库已落定节点的票
 
     def _migrate_pending_approval_nodes(self):
         """老库中仍待决的高风险批次没有审批节点行：补一个内置默认节点
@@ -224,6 +282,32 @@ class Database:
                     activated_at, deadline, created_at)
                    VALUES (?,0,'any','active',?,?,?,?)""",
                 (r["id"], max(timeout, 1.0), r["created_at"], deadline, r["created_at"]))
+
+    def _migrate_node_votes(self):
+        """老库中已落定（approved/rejected/skipped）的节点没有逐票记录：按节点上的
+        决定人补一张票，使新模型下计数、「同一人不承担多节点」与审计视图保持完整。
+        幂等：已有票的节点不重复补。仍 active 的老节点不补——它们的票将在决定时落。"""
+        rows = self._conn.execute(
+            """SELECT n.id AS node_id, n.batch_id AS batch_id, n.status AS status,
+                      n.decided_by AS decided_by, n.decided_role AS decided_role,
+                      n.decision_reason AS reason, n.decision_note AS note,
+                      n.decided_at AS decided_at
+               FROM replay_approval_nodes n
+               WHERE n.status IN ('approved','rejected','skipped')
+                 AND n.decided_by IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM replay_node_votes v
+                                 WHERE v.node_id = n.id)""").fetchall()
+        for r in rows:
+            vote = {"approved": "approve", "rejected": "reject",
+                    "skipped": "skip"}[r["status"]]
+            ts = r["decided_at"] or 0.0
+            self._conn.execute(
+                """INSERT INTO replay_node_votes
+                   (node_id, batch_id, vote, voter, voter_role, delegation_id,
+                    status, reason, note, created_at, invalidated_at)
+                   VALUES (?,?,?,?,?,NULL,'valid',?,?,?,NULL)""",
+                (r["node_id"], r["batch_id"], vote, r["decided_by"],
+                 r["decided_role"] or "any", r["reason"], r["note"], ts))
 
     def _migrate(self):
         """对老版本数据库就地补列（新库由 SCHEMA 直接建出完整结构，这里自动跳过）。"""
@@ -269,6 +353,22 @@ class Database:
             if cols and "blocked_reason" not in cols:
                 self._conn.execute(
                     "ALTER TABLE replay_tasks ADD COLUMN blocked_reason TEXT")
+        if "replay_approval_nodes" in tables:
+            # 法定人数/多角色：老节点视为单角色、法定人数 1
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(replay_approval_nodes)")}
+            if cols and "allowed_roles" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE replay_approval_nodes ADD COLUMN "
+                    "allowed_roles TEXT NOT NULL DEFAULT '[\"any\"]'")
+                # 回填允许角色：以老节点的指定角色为准
+                self._conn.execute(
+                    "UPDATE replay_approval_nodes SET "
+                    "allowed_roles = json_array(role)")
+            if cols and "required_approvals" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE replay_approval_nodes ADD COLUMN "
+                    "required_approvals INTEGER NOT NULL DEFAULT 1")
 
     @contextmanager
     def tx(self):

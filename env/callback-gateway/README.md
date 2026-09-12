@@ -21,6 +21,8 @@
                 │ 业务重放层  /admin/replays/*                        │
                 │   筛选预览 → 批量提交 → 多级审批 → 暂停/继续/取消     │
                 │   审批策略版本化维护 /admin/replay-policies/*        │
+                │   审批委托（生效/失效/撤销/再激活）                    │
+                │     /admin/replay-delegations/*                      │
                 │   重放副作用走同一 outbox 幂等链路                   │
                 └────────────────────────────────────────────────────┘
 ```
@@ -46,14 +48,16 @@
 | 高风险批次须他人审批后才能执行 | 提交带 `risk_level=high` + `approval_note`：批次落 `pending_approval`，worker 不领取；`POST .../approve`（审批人必须不同于发起人）放行，`POST .../reject`（必填原因）整体取消；超时由 worker 自动释放，见 `app/replay.py` |
 | 审批策略可配置、版本化维护 | `POST /admin/replay-policies` 提交新策略：校验通过整份生效（版本号单调递增），失败保留当前策略；`GET .../current` / `.../versions` 查当前策略与每次变更/尝试记录，见 `app/replay_policy.py` |
 | 按风险等级与批次规模生成串行/并行审批节点 | 策略规则按 `risk_level` + `min_size`/`max_size` 匹配，`mode=serial` 逐节点激活（各自起算截止时间），`mode=parallel` 全部同时待决；提交时生成 `replay_approval_nodes` |
-| 每个节点记录指定角色、实际审批人、截止时间 | `replay_approval_nodes`：role / decided_by / decided_role / deadline；指定角色非 `any` 时审批人须声明匹配角色 |
-| 审批人不能重复承担同一批次的多个节点 | 节点决定时同事务检查本批其他节点未被该审批人决定过（含批准/跳过/拒绝），违反 403 |
-| 任一节点拒绝即终止批次，全部批准才放行 | 节点拒绝 → 批次 `rejected`、未执行任务整体取消；全部节点批准（或有理由跳过）→ 批次才进 `running`，worker 与 outbox 派发闸门口径不变 |
-| 批次保存提交时的策略快照 | `replay_batches.policy_version` + `policy_snapshot`（规则/模式/节点规格）；策略更新只影响新提交的批次 |
-| 详情展示当前节点、剩余节点与超时状态 | 批次详情 `approval`：`nodes`（各节点角色/审批人/截止时间/超时）、`current_node_ids`、`remaining_node_ids`、`expired_on_time` |
-| 批准/拒绝/跳过/超时/策略变更都可审计 | `replay_approval_node_approved`/`rejected`/`skipped`/`expired`/`activated` + 既有批次级事件 + `replay_policy_applied`/`rejected`；节点可带原因跳过（视为满足，留痕） |
+| 每个节点记录允许角色、法定人数、实际审批人、截止时间 | `replay_approval_nodes`：allowed_roles / required_approvals / decided_by / deadline；节点有效赞成票达到法定人数才满足，串行节点按节点分别计数，并行节点各自达标才算全部满足 |
+| 同一审批人不能重复计数或承担多个节点 | `replay_node_votes` 部分唯一索引：同一节点同一人至多一张有效票、同一批次同一人至多在一个节点持有效票（写事务串行 + 条件更新兜底并发），违反/重复决定 409 |
+| 角色审批须凭当前有效的委托 | `POST /admin/replay-delegations` 为角色创建带生效/失效时间的委托（受托人、时间窗），决定时携带 `delegation_id`：本人、角色匹配、时间窗覆盖当前时刻且未撤销才接受；委托可撤销（原因必填）与重新激活，见 `app/delegation.py` |
+| 委托到期/撤销后未满足节点重新等待，已落定节点不改写 | worker 每轮先扫委托到期；失效/撤销委托投在仍 `active` 节点上的赞成票置 `invalid`，有效人数回退、缺额重新等待；已达法定人数/拒绝/跳过/超时的节点永不改写 |
+| 任一节点拒绝即终止批次，全部节点满足才放行 | 节点拒绝 → 批次 `rejected`、未执行任务整体取消；全部节点达到法定人数（或有理由跳过）→ 批次才进 `running`，worker 与 outbox 派发闸门口径不变 |
+| 批次保存提交时的策略快照 | `replay_batches.policy_version` + `policy_snapshot`（规则/模式/节点规格含角色与法定人数）；策略更新只影响新提交的批次 |
+| 详情展示每节点已批准人数/法定人数/有效委托/缺额 | 批次详情 `approval.nodes`：`approved_count`、`required_approvals`、`missing`、`quorum_reached`、`valid_delegations`（允许角色当前有效的委托）、每张票（含已失效票）；另有批次级 `missing_approvals` |
+| 委托与决定全生命周期可审计 | `replay_delegation_created`/`revoked`/`reactivated`/`expired`、`replay_node_vote_invalidated`、`replay_approval_node_quorum_lost` + 既有节点/批次事件；节点可带原因跳过（视为满足，留痕） |
 | 审批结果/拒绝原因/超时释放/批准后执行全部可审计 | `replay_batch_approved` / `replay_batch_rejected`（含 reason）/ `replay_batch_approval_expired` + 既有执行事件；批次详情含 `approval`（状态、发起人、审批人、批准时间、拒绝原因、截止时间） |
-| 重复提交或重复批准不会执行两次 | `request_id` 重复提交返回原批次；节点决定、批准/拒绝/超时/取消都是带状态守卫的条件更新（写事务串行），重复决定返回 409，不产生第二套任务、节点与事件 |
+| 重复提交或重复/并发决定不会执行两次 | `request_id` 重复提交返回原批次；票有部分唯一索引、节点/批次决定是带状态守卫的条件更新（写事务串行），重复决定返回 409，不重复计数、不产生第二套任务与事件 |
 | 批次级并发配额 | 提交时 `max_concurrency` 指定整批最多同时处理多少条；占用=本批 `processing` 任务数，领取时在占位事务里实时推导复核，见 `app/replay.py` |
 | 同一编号多条历史版本按 created_at 先后执行 | 任务落盘快照 `delivery_created_at` 作排序键；前序未进终态（done/failed/cancelled）时条件更新拒绝领取后一条 |
 | 批次详情显示占用/等待/每条阻塞原因 | `GET /admin/replays/{id}`：`in_flight`（当前占用）、`waiting`（等待数量）、每条任务的 `blocked_reason`（实时计算） |
@@ -76,7 +80,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 94 个端到端测试
+python -m pytest tests/          # 106 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -280,6 +284,9 @@ curl localhost:8000/admin/replay-policies/current
 #   规则按序匹配，第一条「风险等级相符且批次规模落在区间内」的规则生效；
 #   mode=serial  节点逐个激活，上一节点满足后才激活下一节点（各自起算截止时间）
 #   mode=parallel 所有节点同时待决，全部满足才放行
+#   节点可配置：
+#     role 单个允许角色 / roles 角色列表（any = 任何非发起人）
+#     required_approvals 法定人数（默认 1）：有效赞成票达到该数节点才满足
 curl -X POST localhost:8000/admin/replay-policies \
   -H 'Content-Type: application/json' \
   -d '{
@@ -287,7 +294,8 @@ curl -X POST localhost:8000/admin/replay-policies \
     "policy": {"rules": [
       {"name": "high-large", "risk_level": "high", "min_size": 10, "mode": "serial",
        "nodes": [
-         {"role": "ops-lead", "timeout_seconds": 1800},
+         {"roles": ["ops-lead", "oncall-lead"], "required_approvals": 2,
+          "timeout_seconds": 1800},
          {"role": "finance-controller", "timeout_seconds": 3600}
        ]},
       {"name": "high-small", "risk_level": "high", "mode": "parallel",
@@ -304,41 +312,96 @@ curl -X POST localhost:8000/admin/replay-policies \
 curl localhost:8000/admin/replay-policies/versions
 ```
 
-- **节点链随批次落盘（策略快照）**：提交时解析出的规则与节点规格保存在
-  `replay_batches.policy_snapshot`（连同 `policy_version`），审批节点行一次性
-  生成——之后策略再更新也**不改变已提交的批次**，只影响新提交。
+- **节点链随批次落盘（策略快照）**：提交时解析出的规则与节点规格（含允许角色与
+  法定人数）保存在 `replay_batches.policy_snapshot`（连同 `policy_version`），
+  审批节点行一次性生成——之后策略再更新也**不改变已提交的批次**，只影响新提交。
 - **fail closed**：已有生效策略时，高风险批次若没有任何规则匹配，提交直接被
   拒绝（`422 no_applicable_policy`），不会静默降低审批要求；普通批次无匹配
   规则则直接运行。
-- **每个节点**记录指定角色（`role`，`any` 表示任何非发起人）、实际审批人
-  （`decided_by`/`decided_role`）与截止时间（`deadline`，激活时起算）。
-  指定角色非 `any` 的节点，审批人必须声明匹配的角色才能决定。
-- **职责分离**：审批人不能是批次发起人，也不能重复承担同一批次的多个节点
-  （批准/跳过/拒绝合计只算一次，违反返回 403）。
-- **节点级操作**：
+- **法定人数按节点分别计数**：串行节点逐个满足（上一节点达到人数后才激活下一
+  节点）；并行节点各自达到法定人数才算全部满足。每张赞成票是
+  `replay_node_votes` 中的一行，同一审批人在同一节点只有一张有效票（重复/
+  并发决定返回 409，不重复计数），在同一批次也不能在多个节点持有效票。
+- **每个节点**记录允许角色（`allowed_roles`，`any` 表示任何非发起人）、法定
+  人数（`required_approvals`）、实际落定人（`decided_by`/`decided_role`）与
+  截止时间（`deadline`，激活时起算）。承担指定角色必须凭本人**当前有效的
+  审批委托**（见下节）。
+- **职责分离**：审批人不能是批次发起人；一人在同一批次至多在一个节点持有效票
+  （违反返回 403）。
+- **节点级操作**（承担指定角色时须携带本人当前有效的 `delegation_id`；`any`
+  节点可省略）：
   ```bash
-  # 批准 / 拒绝（必填原因）/ 跳过（必填原因，视为该节点已满足，留痕可追溯）
+  # 赞成票（法定人数 > 1 时需多人分别投票，达到人数节点才落定；返回
+  # approved_count/required_approvals/missing 实时计数）
   curl -X POST localhost:8000/admin/replays/3/nodes/7/approve \
     -H 'Content-Type: application/json' \
-    -d '{"operator": "ops-wang", "role": "ops-lead", "note": "现场已核对"}'
+    -d '{"operator": "ops-wang", "role": "ops-lead", "delegation_id": 12,
+         "note": "现场已核对"}'
+  # 拒绝（必填原因）/ 跳过（必填原因，视为该节点已满足，留痕可追溯）
   curl -X POST localhost:8000/admin/replays/3/nodes/8/reject \
     -H 'Content-Type: application/json' \
-    -d '{"operator": "ops-zhao", "role": "finance-controller", "reason": "影响面评估不通过"}'
+    -d '{"operator": "ops-zhao", "role": "finance-controller", "delegation_id": 13,
+         "reason": "影响面评估不通过"}'
   curl -X POST localhost:8000/admin/replays/3/nodes/8/skip \
     -H 'Content-Type: application/json' \
-    -d '{"operator": "ops-zhao", "role": "finance-controller",
+    -d '{"operator": "ops-zhao", "role": "finance-controller", "delegation_id": 13,
          "reason": "主管休假，值班经理代签已电话确认"}'
   ```
   任一节点**拒绝**或**超时**即终止整个批次（未执行任务整体取消）；所有节点
-  **批准**（或被有理由**跳过**）后批次才进入 `running`，worker 方可领取。
-  批次级 `/approve`、`/reject` 入口在恰好一个节点待决时仍然可用（单节点批次
-  行为与之前一致）。
-- **批次详情**的 `approval` 展示：`nodes`（每个节点的角色、状态、实际审批人、
-  截止时间、是否已超时）、`current_node_ids`（当前待决节点）、
-  `remaining_node_ids`（剩余节点）、`policy_version` 与整体超时状态。
-- **审计**：节点批准/拒绝/跳过/超时/激活（`replay_approval_node_*`）、批次放行/
-  拒绝/超时释放（`replay_batch_approved`/`rejected`/`approval_expired`）、策略
-  变更（`replay_policy_applied`/`rejected`）全部落 `events`，可按批次一次查全。
+  达到法定人数（或被有理由**跳过**）后批次才进入 `running`，worker 方可领取。
+  批次级 `/approve`、`/reject` 入口在恰好一个节点待决时仍然可用（单节点、
+  法定人数 1 的批次行为与之前一致）。
+- **批次详情**的 `approval` 展示：`nodes`（每个节点的允许角色、法定人数
+  `required_approvals`、有效赞成人数 `approved_count`、还缺多少人 `missing`、
+  `quorum_reached`、每张票 `votes`——含已失效票及其失效时间、允许角色当前
+  有效的委托 `valid_delegations`、状态、实际落定人、截止时间、是否已超时）、
+  批次级 `missing_approvals`、`current_node_ids`、`remaining_node_ids`、
+  `policy_version` 与整体超时状态。
+- **审计**：委托生命周期（`replay_delegation_created`/`revoked`/
+  `reactivated`/`expired`）、票失效与法定人数回退（`replay_node_vote_invalidated`/
+  `replay_approval_node_quorum_lost`）、节点赞成/拒绝/跳过/超时/激活
+  （`replay_approval_node_*`）、批次放行/拒绝/超时释放
+  （`replay_batch_approved`/`rejected`/`approval_expired`）、策略变更
+  （`replay_policy_applied`/`rejected`）全部落 `events`，可按批次一次查全。
+
+## 审批委托
+
+运营可以把某个审批角色在**生效/失效时间窗**内委托给受托人（`app/delegation.py`）。
+受托人对指定角色节点做决定时必须携带委托 id，决定在写事务里校验委托**当前有效**
+（授给本人、角色在节点允许角色内、时间窗覆盖当前时刻、未撤销；即使到期扫描
+尚未运行，过期委托也会在决定时被拒绝）。
+
+```bash
+# 创建委托（epoch 秒或 ISO-8601；未到生效时间显示 pending）
+curl -X POST localhost:8000/admin/replay-delegations \
+  -H 'Content-Type: application/json' \
+  -d '{"role": "ops-lead", "delegatee": "ops-wang", "operator": "ops-admin",
+       "valid_from": "2026-09-12T00:00:00Z", "valid_to": "2026-09-19T00:00:00Z",
+       "note": "主管休假一周"}'
+# -> {"result": "created", "delegation_id": 12, "current": true}
+
+curl 'localhost:8000/admin/replay-delegations?role=ops-lead'   # 列表（可按角色/受托人/状态过滤）
+curl localhost:8000/admin/replay-delegations/12               # 单条（含 current/effective_status）
+
+# 撤销（原因必填）：未达到法定人数节点上基于它的赞成票立即失效，节点重新等待；
+# 已落定节点（已达人数/拒绝/跳过/超时）不会被改写
+curl -X POST localhost:8000/admin/replay-delegations/12/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"operator": "ops-admin", "reason": "授权提前结束"}'
+# -> {"result": "revoked", "affected_nodes": [{"node_id": 7, "approved_count": 0,
+#     "required_approvals": 2, "missing": 2, ...}]}
+
+# 重新激活（给新的有效时间窗）；曾经失效的票不自动复活，须重新决定
+curl -X POST localhost:8000/admin/replay-delegations/12/reactivate \
+  -H 'Content-Type: application/json' \
+  -d '{"operator": "ops-admin",
+       "valid_from": "2026-09-20T00:00:00Z", "valid_to": "2026-09-26T00:00:00Z"}'
+```
+
+- **自然到期**：replay worker 每轮先扫委托到期（先于审批超时与任务领取），
+  把过窗委托置 `expired` 并令其未满足节点上的票失效，节点缺额重新等待。
+- **失效票**保留为 `invalid`（带 `invalidated_at` 与审计事件），不参与计数、
+  不再占位（失效后该受托人可以重新投票或承担本批其他节点）。
 
 
 

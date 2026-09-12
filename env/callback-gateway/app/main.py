@@ -5,8 +5,9 @@
 - 处理（worker.py 后台任务）：重试、隔离、副作用派发；
 - 人工处置（admin.py）：冲突比较/选定、隔离重投、审计查询；
 - 业务重放（replay.py）：筛选预览 -> 批量提交 -> 多级审批（replay_policy.py 策略
-  按风险等级与批次规模生成串行/并行审批节点，全部批准才放行）-> 暂停/继续/取消
-  -> 审计查询。
+  按风险等级与批次规模生成串行/并行审批节点，每节点带允许角色与法定人数；
+  delegation.py 的角色委托须在决定时当前有效，全部节点满足才放行）-> 暂停/继续/
+  取消 -> 审计查询。
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from . import audit
 from .admin import create_admin_router
 from .config import Settings
 from .db import Database
+from .delegation import create_delegation_router
 from .ingest import ingest
 from .keyconfig import KeyConfigStore, KeyRotationService
 from .replay import ReplayWorker, create_replay_router
@@ -93,6 +95,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(create_admin_router(db, keys))
     app.include_router(create_replay_router(db, settings))
     app.include_router(create_policy_router(db, settings.replay_approval_timeout_seconds))
+    app.include_router(create_delegation_router(db))
     return app
 
 

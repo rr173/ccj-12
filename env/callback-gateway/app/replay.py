@@ -59,6 +59,7 @@ from pydantic import BaseModel, Field
 from . import audit
 from .config import Settings
 from .db import Database
+from . import delegation as delegation_mod
 from .handlers import business_handler
 from .replay_policy import ROLE_ANY, match_rule, resolve_rules
 
@@ -110,19 +111,26 @@ class BatchActionRequest(BaseModel):
 class ApprovalRequest(BaseModel):
     """高风险批次的批准/拒绝请求：审批人必须是不同于发起人的运营人员。"""
     operator: str                  # 审批人（必填，须不同于批次发起人）
+    delegation_id: int | None = None  # 承担指定角色所用的有效委托（any 节点可省）
     note: str = ""                 # 批准备注（可选）
 
 
 class RejectionRequest(BaseModel):
     operator: str                  # 审批人（必填，须不同于批次发起人）
     reason: str                    # 拒绝原因（必填，落批次与审计）
+    delegation_id: int | None = None
     note: str = ""
 
 
 class NodeDecisionRequest(BaseModel):
-    """单个审批节点的批准请求：role 为审批人实际承担的角色（节点指定非 any 角色时必填且须一致）。"""
-    operator: str                  # 审批人（必填，须不同于发起人，且未决定过本批其他节点）
-    role: str | None = None        # 审批人承担的角色；节点指定角色非 any 时必填且必须匹配
+    """单个审批节点的决定请求（批准/拒绝/跳过共用）。
+
+    审批人承担指定角色时须携带本人当前有效的委托 id（delegation_id）；'any' 节点
+    无需委托。role 为审批人实际承担的角色（节点允许多角色时用以指明哪一个）。
+    """
+    operator: str                  # 审批人（必填，须不同于发起人，且未在本批其他节点持有效票）
+    role: str | None = None        # 审批人承担的角色；节点指定非 any 角色时必填且必须被允许
+    delegation_id: int | None = None  # 审批委托 id：承担指定角色时必填且决定时须仍有效
     note: str = ""
 
 
@@ -130,6 +138,7 @@ class NodeRejectionRequest(BaseModel):
     operator: str
     reason: str                    # 拒绝原因（必填）；任一节点拒绝即终止整个批次
     role: str | None = None
+    delegation_id: int | None = None
     note: str = ""
 
 
@@ -137,6 +146,7 @@ class NodeSkipRequest(BaseModel):
     operator: str
     reason: str                    # 跳过原因（必填，留痕可追溯）；跳过视为该节点已满足
     role: str | None = None
+    delegation_id: int | None = None
     note: str = ""
 
 
@@ -162,6 +172,34 @@ NODE_SKIPPED = "skipped"      # 有理由跳过，视为已满足
 NODE_EXPIRED = "expired"      # 超时未决（批次随之取消）
 NODE_CANCELLED = "cancelled"  # 批次被终止/撤回时随之关闭的待决节点
 NODE_UNDECIDED = (NODE_WAITING, NODE_ACTIVE)
+
+
+def node_allowed_roles(spec_or_node) -> list[str]:
+    """节点允许承担的角色列表：策略节点取 roles（兼容只有 role 的老规则），
+    已落盘节点取 allowed_roles JSON（兼容只有 role 列的老库行）。"""
+    keys = spec_or_node.keys()
+    if "allowed_roles" in keys and spec_or_node["allowed_roles"]:
+        raw = spec_or_node["allowed_roles"]
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list) and parsed:
+                    return [str(r) for r in parsed]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif isinstance(raw, list) and raw:
+            return [str(r) for r in raw]
+    roles = spec_or_node["roles"] if "roles" in keys and spec_or_node["roles"] else None
+    if roles:
+        return [str(r) for r in roles]
+    return [spec_or_node["role"]]
+
+
+def node_required(spec_or_node) -> int:
+    """节点法定人数：缺省 1（老策略节点/老库行）。"""
+    value = spec_or_node["required_approvals"] if "required_approvals" in spec_or_node.keys() \
+        else 1
+    return int(value) if value is not None else 1
 
 
 def _require_operator(operator: str, field: str = "operator"):
@@ -350,6 +388,8 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
     snapshot = {"policy_version": policy_version, "rule_name": rule_name, "mode": mode,
                 "risk_level": req.risk_level, "batch_size": total,
                 "nodes": [{"seq": i, "role": n["role"],
+                           "allowed_roles": node_allowed_roles(n),
+                           "required_approvals": node_required(n),
                            "timeout_seconds": n["timeout_seconds"]}
                           for i, n in enumerate(node_specs)]}
     filters = req.model_dump(exclude={"operator", "reason", "request_id", "max_concurrency",
@@ -384,15 +424,18 @@ def submit(db: Database, req: SubmitRequest, approval_timeout: float) -> tuple[i
                      d["created_at"], now, now),
                 )
             # 审批节点链随批次一次性落盘（来自策略快照，之后不随策略变更而改变）：
-            # 串行只激活首节点，并行全部激活；激活时起算各自截止时间
+            # 串行只激活首节点，并行全部激活；激活时起算各自截止时间。
+            # 每个节点带允许角色列表与法定人数（有效赞成票达到才满足）。
             for i, spec in enumerate(node_specs):
                 activated = mode == "parallel" or i == 0
                 cur.execute(
                     """INSERT INTO replay_approval_nodes
-                       (batch_id, seq, role, status, timeout_seconds,
-                        activated_at, deadline, created_at)
-                       VALUES (?,?,?,?,?,?,?,?)""",
+                       (batch_id, seq, role, allowed_roles, required_approvals,
+                        status, timeout_seconds, activated_at, deadline, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (batch_id, i, spec["role"],
+                     json.dumps(node_allowed_roles(spec), ensure_ascii=False),
+                     node_required(spec),
                      NODE_ACTIVE if activated else NODE_WAITING,
                      spec["timeout_seconds"],
                      now if activated else None,
@@ -490,8 +533,15 @@ def _terminate_batch_rejected(cur: sqlite3.Cursor, batch, operator: str,
 
 def _advance_chain(cur: sqlite3.Cursor, batch, operator: str, note: str,
                    now: float) -> dict:
-    """批准/跳过后推进审批链：串行激活下一节点（起算其截止时间）；
-    全部节点满足后批次才进入 running（条件更新保证并发决定最多放行一次）。"""
+    """一票落定后推进审批链：
+
+    - 所有待决节点（waiting/active）都已消失 -> 全部节点满足，批次进入 running
+      （条件更新保证并发决定最多放行一次）；
+    - 串行：若上一节点刚满足且下一节点仍 waiting，激活下一节点（起算其截止时间）；
+    - 并行：批次截止时间收敛为剩余活动节点中最早的截止。
+
+    法定人数节点达到人数时已由 decide_node 落定为 approved，故这里 remaining 为空
+    即代表全部满足，不再按「节点有 decided_by」推断。"""
     batch_id = batch["id"]
     remaining = cur.execute(
         """SELECT * FROM replay_approval_nodes
@@ -513,7 +563,8 @@ def _advance_chain(cur: sqlite3.Cursor, batch, operator: str, note: str,
         return {"batch_status": BATCH_RUNNING, "approval_status": APPROVAL_APPROVED,
                 "remaining_node_ids": []}
     waiting = [n for n in remaining if n["status"] == NODE_WAITING]
-    if waiting:
+    active = [n for n in remaining if n["status"] == NODE_ACTIVE]
+    if waiting and not active:
         # 串行链：上一节点满足后激活下一节点，从此时起算其截止时间
         nxt = waiting[0]
         node_deadline = now + nxt["timeout_seconds"]
@@ -529,10 +580,12 @@ def _advance_chain(cur: sqlite3.Cursor, batch, operator: str, note: str,
         audit.record(cur, "replay_approval_node_activated", None, None,
                      {"replay_batch_id": batch_id, "node_id": nxt["id"],
                       "seq": nxt["seq"], "role": nxt["role"],
+                      "allowed_roles": node_allowed_roles(nxt),
+                      "required_approvals": node_required(nxt),
                       "deadline": node_deadline}, ts=now)
-    else:
+    elif active:
         # 并行：批次截止时间收敛为剩余活动节点中最早的截止
-        earliest = min(n["deadline"] for n in remaining if n["deadline"] is not None)
+        earliest = min(n["deadline"] for n in active if n["deadline"] is not None)
         cur.execute(
             "UPDATE replay_batches SET approval_deadline=?, updated_at=? WHERE id=?",
             (earliest, now, batch_id),
@@ -542,27 +595,44 @@ def _advance_chain(cur: sqlite3.Cursor, batch, operator: str, note: str,
             "remaining_node_ids": [n["id"] for n in remaining]}
 
 
+def _node_approved_count(cur: sqlite3.Cursor, node_id: int) -> int:
+    """节点当前有效赞成票数。"""
+    return cur.execute(
+        "SELECT COUNT(*) AS c FROM replay_node_votes "
+        "WHERE node_id=? AND status='valid' AND vote='approve'",
+        (node_id,),
+    ).fetchone()["c"]
+
+
 def decide_node(db: Database, batch_id: int, node_id: int, action: str,
                 operator: str, role: str | None = None,
+                delegation_id: int | None = None,
                 reason: str = "", note: str = "") -> dict:
     """对单个审批节点做出决定（approve / reject / skip）。
 
+    approve 是投一张赞成票：有效赞成票达到节点法定人数（required_approvals）节点才
+    落定为 approved；reject/skip 一投即让节点落定（拒绝还会终止整个批次）。
+
     所有检查与状态转移在同一个写事务里完成（BEGIN IMMEDIATE 串行化并发决定）：
-    节点仍 active 才接受决定（重复/并发决定得到 409，不会产生第二次效果）；
-    审批人不能是批次发起人，不能重复承担同一批次的多个节点，声明的角色必须与
-    节点指定角色一致（'any' 不限）；拒绝立即终止整个批次；批准/跳过推进审批链，
-    全部节点满足后批次才进入 running。
+    节点仍 active 才接受决定；审批人不能是批次发起人；同一节点同一人只能有一张
+    有效票（部分唯一索引，重复/并发决定得到 409，不重复计数）；同一批次同一人
+    不能在多个节点持有效票（不能承担多个节点）；承担指定角色须凭本人当前有效的
+    委托（角色匹配且时间窗覆盖当前时刻，到期/撤销即不可用），'any' 节点无需委托；
+    委托在节点满足前失效会令其赞成票失效，节点法定人数不足要重新等待。
     """
     operator = _require_operator(operator, "operator")
     reason = (reason or "").strip()
     note = (note or "").strip()
+    if action not in ("approve", "reject", "skip"):
+        raise HTTPException(422, f"unknown action: {action!r}")
     if action in ("reject", "skip") and not reason:
         raise HTTPException(422, f"reason must be non-empty when deciding {action}")
-    new_status = {"approve": NODE_APPROVED, "reject": NODE_REJECTED,
-                  "skip": NODE_SKIPPED}[action]
     now = time.time()
     with db.tx() as cur:
-        batch = _get_batch_or_404(db, batch_id)
+        batch = cur.execute("SELECT * FROM replay_batches WHERE id=?",
+                            (batch_id,)).fetchone()
+        if batch is None:
+            raise HTTPException(404, "replay batch not found")
         node = cur.execute(
             "SELECT * FROM replay_approval_nodes WHERE id=? AND batch_id=?",
             (node_id, batch_id),
@@ -575,45 +645,151 @@ def decide_node(db: Database, batch_id: int, node_id: int, action: str,
         if node["status"] != NODE_ACTIVE:
             raise HTTPException(
                 409, f"node is {node['status']}, decision no longer accepted")
+        allowed_roles = node_allowed_roles(node)
+        designated = [r for r in allowed_roles if r != ROLE_ANY]
         decided_role = (role or "").strip()
-        if node["role"] != ROLE_ANY:
+        used_delegation = None
+        if not designated:
+            # 'any' 节点：任何非发起人都可承担，不需要委托；声明角色仅作记录
+            decided_role = decided_role or ROLE_ANY
+        else:
             if not decided_role:
-                raise HTTPException(422, f"role is required: this node is designated "
-                                         f"to role {node['role']!r}")
-            if decided_role != node["role"]:
-                raise HTTPException(403, f"role {decided_role!r} does not match the "
-                                         f"designated node role {node['role']!r}")
-        elif not decided_role:
-            decided_role = ROLE_ANY
-        # 同一审批人不能重复承担同一批次的多个节点（批准/跳过/拒绝合计只算一次）
-        taken = cur.execute(
-            """SELECT id FROM replay_approval_nodes
-               WHERE batch_id=? AND decided_by=? AND id<>? LIMIT 1""",
+                raise HTTPException(
+                    422, f"role is required: this node may be acted on by roles "
+                         f"{','.join(designated)}")
+            if decided_role not in designated:
+                raise HTTPException(
+                    403, f"role {decided_role!r} is not allowed for this node "
+                         f"(allowed: {','.join(designated)})")
+            # 指定角色：必须凭本人当前有效的委托承担（决定时再校验一次时间窗，
+            # 即使到期扫描尚未跑，过期/撤销的委托也在这里被挡住）
+            used_delegation = delegation_mod.load_for_decision(
+                cur, delegation_id, operator, designated, now)
+        # 同一审批人不能在同一批次的多个节点持有效票（不能承担多个节点）。
+        # 已失效的票不占位——委托失效后该人可以在别的节点投票，也可重新投本节点。
+        other = cur.execute(
+            """SELECT node_id FROM replay_node_votes
+               WHERE batch_id=? AND voter=? AND status='valid' AND node_id<>? LIMIT 1""",
             (batch_id, operator, node_id),
         ).fetchone()
-        if taken is not None:
-            raise HTTPException(403, f"operator has already decided node "
-                                     f"{taken['id']} of this batch")
-        changed = cur.execute(
-            """UPDATE replay_approval_nodes
-               SET status=?, decided_by=?, decided_role=?, decision_reason=?,
-                   decision_note=?, decided_at=?
-               WHERE id=? AND status='active'""",
-            (new_status, operator, decided_role, reason or None, note or None,
-             now, node_id),
-        ).rowcount
-        if not changed:  # 并发下该节点已被另一笔决定
-            raise HTTPException(409, "node is no longer awaiting decision")
-        audit.record(cur, f"replay_approval_node_{new_status}", None, None,
+        if other is not None:
+            raise HTTPException(403, "operator already has an effective vote on node "
+                                     f"{other['node_id']} of this batch")
+        # 同一节点同一人只保留一张有效票（部分唯一索引兜底并发；这里给明确 409）
+        dup = cur.execute(
+            "SELECT id FROM replay_node_votes WHERE node_id=? AND voter=? AND status='valid'",
+            (node_id, operator),
+        ).fetchone()
+        if dup is not None:
+            raise HTTPException(409, "operator has already voted on this node")
+
+        # 落票。INSERT 的部分唯一索引是防并发重复计数的最后一道闸：两个并发决定
+        # 串行化后第二个会撞唯一键，整个事务回滚，不产生第二次计数。
+        vote_row = {
+            "vote": action, "voter_role": decided_role,
+            "delegation_id": used_delegation["id"] if used_delegation is not None else None,
+            "reason": reason or None, "note": note or None,
+        }
+        try:
+            cur.execute(
+                """INSERT INTO replay_node_votes
+                   (node_id, batch_id, vote, voter, voter_role, delegation_id,
+                    status, reason, note, created_at, invalidated_at)
+                   VALUES (?,?,?,?,?,?,'valid',?,?,?,NULL)""",
+                (node_id, batch_id, vote_row["vote"], operator,
+                 vote_row["voter_role"], vote_row["delegation_id"],
+                 vote_row["reason"], vote_row["note"], now),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "duplicate concurrent decision on this node")
+
+        if action == "reject":
+            # 任一节点拒绝即终止整个批次（未执行任务整体取消，其余待决节点关闭）
+            cur.execute(
+                """UPDATE replay_approval_nodes
+                   SET status='rejected', decided_by=?, decided_role=?,
+                       decision_reason=?, decision_note=?, decided_at=?
+                   WHERE id=? AND status='active'""",
+                (operator, decided_role, reason, note or None, now, node_id),
+            )
+            audit.record(cur, "replay_approval_node_rejected", None, None,
+                         {"replay_batch_id": batch_id, "node_id": node_id,
+                          "seq": node["seq"], "role": node["role"],
+                          "allowed_roles": allowed_roles,
+                          "operator": operator, "decided_role": decided_role,
+                          "delegation_id": vote_row["delegation_id"],
+                          "reason": reason, "note": note or None}, ts=now)
+            result = _terminate_batch_rejected(cur, batch, operator, reason, note, now)
+            return {"result": NODE_REJECTED, "batch_id": batch_id, "node_id": node_id,
+                    **result}
+
+        if action == "skip":
+            # 有理由跳过：节点视为已满足（管理覆盖），立即落定，不参与法定人数计数
+            cur.execute(
+                """UPDATE replay_approval_nodes
+                   SET status='skipped', decided_by=?, decided_role=?,
+                       decision_reason=?, decision_note=?, decided_at=?
+                   WHERE id=? AND status='active'""",
+                (operator, decided_role, reason, note or None, now, node_id),
+            )
+            audit.record(cur, "replay_approval_node_skipped", None, None,
+                         {"replay_batch_id": batch_id, "node_id": node_id,
+                          "seq": node["seq"], "role": node["role"],
+                          "allowed_roles": allowed_roles,
+                          "required_approvals": node_required(node),
+                          "operator": operator, "decided_role": decided_role,
+                          "delegation_id": vote_row["delegation_id"],
+                          "reason": reason, "note": note or None}, ts=now)
+            result = _advance_chain(cur, batch, operator, note, now)
+            return {"result": NODE_SKIPPED, "batch_id": batch_id, "node_id": node_id,
+                    **result}
+
+        # approve：计有效赞成票；达到法定人数节点才落定为 approved（串行/并行都按
+        # 节点分别计数）。未达到时节点保持 active，重新等待更多人批准。
+        approved_count = _node_approved_count(cur, node_id)
+        required = node_required(node)
+        quorate = approved_count >= required
+        if quorate:
+            changed = cur.execute(
+                """UPDATE replay_approval_nodes
+                   SET status='approved', decided_by=?, decided_role=?,
+                       decision_note=?, decided_at=?
+                   WHERE id=? AND status='active'""",
+                (operator, decided_role, note or None, now, node_id),
+            ).rowcount
+            if not changed:  # 并发下节点已被拒绝/超时/取消
+                raise HTTPException(409, "node is no longer awaiting decision")
+        audit.record(cur, "replay_approval_node_approved", None, None,
                      {"replay_batch_id": batch_id, "node_id": node_id,
                       "seq": node["seq"], "role": node["role"],
+                      "allowed_roles": allowed_roles,
+                      "required_approvals": required,
                       "operator": operator, "decided_role": decided_role,
-                      "reason": reason or None, "note": note or None}, ts=now)
-        if action == "reject":
-            result = _terminate_batch_rejected(cur, batch, operator, reason, note, now)
-        else:
-            result = _advance_chain(cur, batch, operator, note, now)
-    return {"result": new_status, "batch_id": batch_id, "node_id": node_id, **result}
+                      "delegation_id": vote_row["delegation_id"],
+                      "approved_count": approved_count,
+                      "missing": max(0, required - approved_count),
+                      "quorum_reached": quorate,
+                      "note": note or None}, ts=now)
+        if not quorate:
+            # 法定人数不足：批次继续等待；批次截止时间不变（仍是该节点的截止）
+            remaining = cur.execute(
+                """SELECT id FROM replay_approval_nodes
+                   WHERE batch_id=? AND status IN ('waiting','active') ORDER BY seq""",
+                (batch_id,),
+            ).fetchall()
+            cur.execute("UPDATE replay_batches SET updated_at=? WHERE id=?",
+                        (now, batch_id))
+            return {"result": "voted", "batch_id": batch_id, "node_id": node_id,
+                    "batch_status": BATCH_PENDING_APPROVAL,
+                    "approval_status": APPROVAL_PENDING,
+                    "approved_count": approved_count,
+                    "required_approvals": required,
+                    "missing": required - approved_count,
+                    "remaining_node_ids": [r["id"] for r in remaining]}
+        result = _advance_chain(cur, batch, operator, note, now)
+    return {"result": NODE_APPROVED, "batch_id": batch_id, "node_id": node_id,
+            "approved_count": approved_count,
+            "required_approvals": required, "missing": 0, **result}
 
 
 def _single_active_node(db: Database, batch_id: int):
@@ -629,23 +805,25 @@ def _single_active_node(db: Database, batch_id: int):
     return nodes[0]
 
 
-def approve(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
-    """批准（批次级兼容入口）：定位当前唯一待决节点并批准。
+def approve(db: Database, batch_id: int, operator: str, note: str = "",
+            delegation_id: int | None = None) -> dict:
+    """批准（批次级兼容入口）：定位当前唯一待决节点并投赞成票。
 
-    单节点批次（含内置默认策略）批准即进入 running；多级链上批准后若仍有
-    后续节点，批次保持 pending_approval 直到全部节点满足。
+    单节点且法定人数 1 的批次一票即进入 running；多级链上节点满足后若仍有后续
+    节点，批次保持 pending_approval 直到全部节点满足。
     """
     operator = _require_operator(operator, "operator")
     batch = _get_batch_or_404(db, batch_id)
     _batch_pending_guard(batch)
     node = _single_active_node(db, batch_id)
-    result = decide_node(db, batch_id, node["id"], "approve", operator, note=note)
+    result = decide_node(db, batch_id, node["id"], "approve", operator,
+                         delegation_id=delegation_id, note=note)
     return {"result": "approved", "batch_id": batch_id,
             "status": result["batch_status"]}
 
 
 def reject(db: Database, batch_id: int, operator: str, reason: str,
-           note: str = "") -> dict:
+           note: str = "", delegation_id: int | None = None) -> dict:
     """拒绝（批次级兼容入口）：拒绝当前唯一待决节点，整个批次随之终止。"""
     operator = _require_operator(operator, "operator")
     reason = (reason or "").strip()
@@ -655,7 +833,7 @@ def reject(db: Database, batch_id: int, operator: str, reason: str,
     _batch_pending_guard(batch)
     node = _single_active_node(db, batch_id)
     result = decide_node(db, batch_id, node["id"], "reject", operator,
-                         reason=reason, note=note)
+                         delegation_id=delegation_id, reason=reason, note=note)
     return {"result": "rejected", "batch_id": batch_id,
             "cancelled_tasks": result["cancelled_tasks"]}
 
@@ -897,21 +1075,69 @@ def _live_blocked_reason(batch, task, predecessor, in_flight: int,
     return None
 
 
-def _node_view(node, now: float) -> dict:
-    """单个审批节点的展示：指定角色、实际审批人、截止时间与超时状态。"""
+def _vote_row(r) -> dict:
+    return {
+        "vote": r["vote"], "voter": r["voter"], "voter_role": r["voter_role"],
+        "delegation_id": r["delegation_id"], "status": r["status"],
+        "reason": r["reason"], "note": r["note"], "created_at": r["created_at"],
+        "invalidated_at": r["invalidated_at"],
+    }
+
+
+def _node_votes(db: Database, node_id: int) -> list[dict]:
+    return [_vote_row(r) for r in db.query(
+        "SELECT * FROM replay_node_votes WHERE node_id=? ORDER BY id", (node_id,))]
+
+
+def _current_delegations(db: Database, allowed_roles: list[str],
+                         now: float) -> list[dict]:
+    """节点允许角色当前有效的委托（生效/失效时间窗覆盖 now 且未撤销）。"""
+    designated = [r for r in allowed_roles if r != ROLE_ANY]
+    if not designated:
+        return []  # 'any' 节点任何非发起人都可承担，没有「角色委托」概念
+    marks = ",".join("?" * len(designated))
+    rows = db.query(
+        f"""SELECT * FROM replay_delegations
+            WHERE status='active' AND role IN ({marks})
+              AND valid_from<=? AND valid_to>=?
+            ORDER BY role, id""",
+        (*designated, now, now),
+    )
+    return [{"id": r["id"], "role": r["role"], "delegatee": r["delegatee"],
+             "delegator": r["delegator"], "valid_from": r["valid_from"],
+             "valid_to": r["valid_to"], "note": r["note"]} for r in rows]
+
+
+def _node_view(db: Database, node, now: float) -> dict:
+    """单个审批节点的展示：允许角色、法定人数、有效赞成人数与还缺人数、
+    每张票（含已失效票及失效原因）、当前有效委托、实际落定人与截止时间。"""
+    allowed_roles = node_allowed_roles(node)
+    required = node_required(node)
+    votes = _node_votes(db, node["id"])
+    approved_count = sum(1 for v in votes
+                         if v["status"] == "valid" and v["vote"] == "approve")
     return {
         "id": node["id"],
         "seq": node["seq"],
-        "role": node["role"],                    # 指定角色（'any' 表示任何非发起人）
+        "role": node["role"],                    # 主指定角色（'any' 表示任何非发起人）
+        "allowed_roles": allowed_roles,          # 允许承担该节点的全部角色
+        "required_approvals": required,          # 法定人数
+        "approved_count": approved_count,        # 当前有效赞成人数
+        "missing": max(0, required - approved_count)
+                   if node["status"] == NODE_ACTIVE else 0,  # 还缺多少人（待决时）
+        "quorum_reached": approved_count >= required,
         "status": node["status"],
-        "decided_by": node["decided_by"],        # 实际审批人
-        "decided_role": node["decided_role"],    # 审批人实际承担的角色
+        "decided_by": node["decided_by"],        # 节点落定（达法定人数/拒绝/跳过）的决定人
+        "decided_role": node["decided_role"],
         "decision_reason": node["decision_reason"],
         "decision_note": node["decision_note"],
         "timeout_seconds": node["timeout_seconds"],
         "activated_at": node["activated_at"],
         "deadline": node["deadline"],
         "decided_at": node["decided_at"],
+        "votes": votes,
+        # 该节点允许角色当前有效的委托（决定时凭它承担角色）
+        "valid_delegations": _current_delegations(db, allowed_roles, now),
         "expired_on_time": (node["status"] == NODE_ACTIVE
                             and node["deadline"] is not None
                             and node["deadline"] <= now),
@@ -920,7 +1146,8 @@ def _node_view(node, now: float) -> dict:
 
 def _approval_view(db: Database, row, now: float | None = None) -> dict:
     """批次当前审批状态与操作者：发起人、审批人、决定时间/原因、策略版本、
-    各审批节点（指定角色/实际审批人/截止时间）、当前待决节点、剩余节点与超时状态。
+    各审批节点（允许角色/法定人数/有效赞成人数/有效委托/还缺多少人/每张票）、
+    当前待决节点、剩余节点与超时状态。
 
     approved/可执行的前提是 approval_status='approved'；expired_on_time 只用于
     详情提示——状态转移以 worker 下一轮扫描（或手动 run_once）为准。
@@ -928,7 +1155,41 @@ def _approval_view(db: Database, row, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     nodes = db.query(
         "SELECT * FROM replay_approval_nodes WHERE batch_id=? ORDER BY seq",
-        (row["id"],))
+        (row["id"],),
+    )
+    node_views = []
+    for n in nodes:
+        votes = [_vote_row(r) for r in db.query(
+            "SELECT * FROM replay_node_votes WHERE node_id=? ORDER BY id", (n["id"],))]
+        allowed_roles = node_allowed_roles(n)
+        required = node_required(n)
+        approved_count = sum(1 for v in votes
+                             if v["status"] == "valid" and v["vote"] == "approve")
+        node_views.append({
+            "id": n["id"],
+            "seq": n["seq"],
+            "role": n["role"],
+            "allowed_roles": allowed_roles,
+            "required_approvals": required,
+            "approved_count": approved_count,
+            "missing": max(0, required - approved_count)
+                       if n["status"] == NODE_ACTIVE else 0,
+            "quorum_reached": approved_count >= required,
+            "status": n["status"],
+            "decided_by": n["decided_by"],
+            "decided_role": n["decided_role"],
+            "decision_reason": n["decision_reason"],
+            "decision_note": n["decision_note"],
+            "timeout_seconds": n["timeout_seconds"],
+            "activated_at": n["activated_at"],
+            "deadline": n["deadline"],
+            "decided_at": n["decided_at"],
+            "votes": votes,
+            "valid_delegations": _current_delegations(db, allowed_roles, now),
+            "expired_on_time": (n["status"] == NODE_ACTIVE
+                                and n["deadline"] is not None
+                                and n["deadline"] <= now),
+        })
     view = {
         "risk_level": row["risk_level"],
         "approval_note": row["approval_note"],
@@ -944,10 +1205,12 @@ def _approval_view(db: Database, row, now: float | None = None) -> dict:
             and row["approval_deadline"] is not None
             and row["approval_deadline"] <= now),
         "policy_version": row["policy_version"],
-        "nodes": [_node_view(n, now) for n in nodes],
+        "nodes": node_views,
         # 当前待决节点 / 剩余节点（待决 + 尚未轮到的串行节点）
         "current_node_ids": [n["id"] for n in nodes if n["status"] == NODE_ACTIVE],
         "remaining_node_ids": [n["id"] for n in nodes if n["status"] in NODE_UNDECIDED],
+        # 批次级汇总：还缺多少张有效赞成票（仅统计待决节点）
+        "missing_approvals": sum(v["missing"] for v in node_views),
     }
     return view
 
@@ -1055,7 +1318,10 @@ class ReplayWorker:
 
     def run_once(self):
         now = self.clock()
-        # 先处理审批超时：到期仍无人批准的高风险批次整体取消（释放其占住的任务），
+        # 先处理委托到期：到期委托投在未满足节点上的赞成票失效（节点重新等待
+        # 法定人数），必须先于审批超时与领取，保证本轮门禁基于最新有效票数
+        delegation_mod.expire_delegations(self.db, now)
+        # 再处理审批超时：到期仍未满足节点法定人数的批次整体取消（释放占住的任务），
         # 必须先于领取，保证超时批次的任务本轮绝不会被领取
         expire_approvals(self.db, now)
         # 待审批批次的 pending 任务也取出交给领取闸门：闸门会以 awaiting_approval
@@ -1338,32 +1604,34 @@ def create_replay_router(db: Database, settings: Settings) -> APIRouter:
 
     @router.post("/{batch_id}/approve")
     def approve_endpoint(batch_id: int, req: ApprovalRequest):
-        """批准（批次级兼容入口）：批准当前唯一待决节点；全部节点满足后批次进入 running。"""
-        return approve(db, batch_id, req.operator, req.note)
+        """批准（批次级兼容入口）：向当前唯一待决节点投赞成票；全部节点满足后批次进入 running。"""
+        return approve(db, batch_id, req.operator, req.note, req.delegation_id)
 
     @router.post("/{batch_id}/reject")
     def reject_endpoint(batch_id: int, req: RejectionRequest):
         """拒绝（批次级兼容入口，拒绝原因必填）：拒绝当前唯一待决节点，批次整体终止。"""
-        return reject(db, batch_id, req.operator, req.reason, req.note)
+        return reject(db, batch_id, req.operator, req.reason, req.note,
+                      req.delegation_id)
 
     @router.post("/{batch_id}/nodes/{node_id}/approve")
     def approve_node_endpoint(batch_id: int, node_id: int, req: NodeDecisionRequest):
-        """批准指定审批节点：审批人须非发起人、未决定过本批其他节点，
-        声明角色须与节点指定角色一致（'any' 不限）。"""
+        """对指定审批节点投赞成票：审批人须非发起人、未在本批其他节点持有效票，
+        承担指定角色须凭本人当前有效的委托（delegation_id）；有效赞成票达到
+        节点法定人数后节点才满足。"""
         return decide_node(db, batch_id, node_id, "approve", req.operator,
-                           req.role, note=req.note)
+                           req.role, req.delegation_id, note=req.note)
 
     @router.post("/{batch_id}/nodes/{node_id}/reject")
     def reject_node_endpoint(batch_id: int, node_id: int, req: NodeRejectionRequest):
         """拒绝指定审批节点（原因必填）：任一节点拒绝即终止整个批次。"""
         return decide_node(db, batch_id, node_id, "reject", req.operator,
-                           req.role, req.reason, req.note)
+                           req.role, req.delegation_id, req.reason, req.note)
 
     @router.post("/{batch_id}/nodes/{node_id}/skip")
     def skip_node_endpoint(batch_id: int, node_id: int, req: NodeSkipRequest):
         """跳过指定审批节点（原因必填，留痕可追溯）：该节点视为已满足，审批链继续推进。"""
         return decide_node(db, batch_id, node_id, "skip", req.operator,
-                           req.role, req.reason, req.note)
+                           req.role, req.delegation_id, req.reason, req.note)
 
     @router.post("/{batch_id}/pause")
     def pause_endpoint(batch_id: int, req: BatchActionRequest):

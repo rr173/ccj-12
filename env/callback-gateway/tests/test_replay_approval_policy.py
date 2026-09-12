@@ -144,8 +144,32 @@ def task_for(client, batch_id, external_id):
 
 
 def approve_node(client, batch_id, node_id, operator, role, note=""):
+    """凭本人当前有效的角色委托对节点投赞成票。"""
+    roles = {LEAD: "ops-lead", FINANCE: "finance-controller", SECURITY: "security"}
+    delegation_id = delegate(client, roles[operator], operator)
     return client.post(f"/admin/replays/{batch_id}/nodes/{node_id}/approve",
-                       json={"operator": operator, "role": role, "note": note})
+                       json={"operator": operator, "role": role,
+                             "delegation_id": delegation_id, "note": note})
+
+
+def delegate(client, role, delegatee, *, operator="ops-grant",
+             valid_from=None, valid_to=None, note=""):
+    """为角色创建一份覆盖当前时刻的委托，返回 delegation id。"""
+    now = time.time()
+    payload = {"role": role, "delegatee": delegatee, "operator": operator,
+               "valid_from": valid_from if valid_from is not None else now - 60,
+               "valid_to": valid_to if valid_to is not None else now + 3600,
+               "note": note}
+    r = client.post("/admin/replay-delegations", json=payload)
+    assert r.status_code == 201, r.json()
+    return r.json()["delegation_id"]
+
+
+def raw_approve_node(client, batch_id, node_id, operator, role=None,
+                     delegation_id=None, note=""):
+    return client.post(f"/admin/replays/{batch_id}/nodes/{node_id}/approve",
+                       json={"operator": operator, "role": role,
+                             "delegation_id": delegation_id, "note": note})
 
 
 # ---- 策略版本管理 ---------------------------------------------------------------
@@ -223,6 +247,52 @@ def test_policy_size_validation_rules(client):
     assert any("risk_level" in x for x in r.json()["reasons"])
 
 
+def test_policy_node_quorum_and_roles_validation(client):
+    # required_approvals 必须是 >=1 的整数；roles 必须是非空字符串列表；
+    # 节点至少要给出 role 或 roles
+    r = client.post("/admin/replay-policies", json={
+        "operator": "ops-policy", "policy": {"rules": [
+            {"risk_level": "high", "nodes": [
+                {"role": "ops-lead", "required_approvals": 0,
+                 "timeout_seconds": 100}]}]}})
+    assert r.status_code == 422
+    assert any("required_approvals" in x for x in r.json()["reasons"])
+    r = client.post("/admin/replay-policies", json={
+        "operator": "ops-policy", "policy": {"rules": [
+            {"risk_level": "high", "nodes": [
+                {"roles": ["ops-lead", ""], "timeout_seconds": 100}]}]}})
+    assert r.status_code == 422
+    assert any("roles" in x for x in r.json()["reasons"])
+    r = client.post("/admin/replay-policies", json={
+        "operator": "ops-policy", "policy": {"rules": [
+            {"risk_level": "high", "nodes": [
+                {"roles": [], "timeout_seconds": 100}]}]}})
+    assert r.status_code == 422
+    r = client.post("/admin/replay-policies", json={
+        "operator": "ops-policy", "policy": {"rules": [
+            {"risk_level": "high", "nodes": [{"timeout_seconds": 100}]}]}})
+    assert r.status_code == 422
+    assert any("role" in x for x in r.json()["reasons"])
+
+    # 合法的多角色 + 法定人数策略整份生效，快照中可见 allowed_roles/required_approvals
+    rules = [
+        {"name": "quorum", "risk_level": "high", "mode": "parallel", "nodes": [
+            {"roles": ["ops-lead", "finance-controller"],
+             "required_approvals": 3, "timeout_seconds": 1800}]},
+        {"name": "none", "risk_level": "normal", "nodes": []},
+    ]
+    v = apply_policy(client, rules)
+    cur = client.get("/admin/replay-policies/current").json()["policy"]["rules"]
+    node = cur[0]["nodes"][0]
+    assert node["roles"] == ["ops-lead", "finance-controller"]
+    assert node["role"] == "ops-lead" and node["required_approvals"] == 3
+    process_normally(client, "PV-1", b'{"order": 1}')
+    bid = submit_high(client, "PV-1").json()["batch_id"]
+    snap = detail(client, bid)["batch"]["policy_snapshot"]
+    assert snap["nodes"][0]["allowed_roles"] == ["ops-lead", "finance-controller"]
+    assert snap["nodes"][0]["required_approvals"] == 3
+
+
 # ---- 串行多级审批 ---------------------------------------------------------------
 
 def test_serial_chain_full_flow_with_roles_and_audit(client):
@@ -258,16 +328,25 @@ def test_serial_chain_full_flow_with_roles_and_audit(client):
     assert task_for(client, batch_id, "MS-1")["blocked_reason"] == "awaiting_approval"
 
     # 尚未轮到的节点不能接受决定
-    assert approve_node(client, batch_id, n1["id"], FINANCE,
-                        "finance-controller").status_code == 409
-    # 发起人不能审批自己的批次
-    assert approve_node(client, batch_id, n0["id"], SUBMITTER,
-                        "ops-lead").status_code == 403
-    # 指定角色的节点：不带角色 422，角色不符 403
-    assert client.post(f"/admin/replays/{batch_id}/nodes/{n0['id']}/approve",
-                       json={"operator": LEAD}).status_code == 422
-    assert approve_node(client, batch_id, n0["id"], LEAD,
-                        "finance-controller").status_code == 403
+    assert raw_approve_node(client, batch_id, n1["id"], FINANCE,
+                           "finance-controller",
+                           delegation_id=delegate(client, "finance-controller", FINANCE)
+                           ).status_code == 409
+    # 发起人不能审批自己的批次（自检先于委托校验）
+    assert raw_approve_node(client, batch_id, n0["id"], SUBMITTER, "ops-lead",
+                           delegation_id=delegate(client, "ops-lead", SUBMITTER)
+                           ).status_code == 403
+    # 指定角色的节点：不带角色 422
+    assert raw_approve_node(client, batch_id, n0["id"], LEAD).status_code == 422
+    # 凭他人委托不能承担节点（委托必须授给本人）
+    other_id = delegate(client, "finance-controller", FINANCE)
+    assert raw_approve_node(client, batch_id, n0["id"], LEAD,
+                           "finance-controller", delegation_id=other_id
+                           ).status_code == 403
+    # 角色与委托不匹配 403
+    lead_fin = delegate(client, "finance-controller", LEAD)
+    assert raw_approve_node(client, batch_id, n0["id"], LEAD, "ops-lead",
+                           delegation_id=lead_fin).status_code == 403
 
     # 第一级：ops-lead 角色批准 -> 第二节点激活并起算截止时间，批次仍待决
     r = approve_node(client, batch_id, n0["id"], LEAD, "ops-lead", note="现场已核对")
@@ -405,6 +484,7 @@ def test_parallel_any_rejection_terminates_batch(client):
     approve_node(client, batch_id, n0["id"], LEAD, "ops-lead")
     r = client.post(f"/admin/replays/{batch_id}/nodes/{n1['id']}/reject",
                     json={"operator": SECURITY, "role": "security",
+                          "delegation_id": delegate(client, "security", SECURITY),
                           "reason": "安全评估不通过", "note": "先冻结"})
     assert r.status_code == 200
     assert r.json()["cancelled_tasks"] == 1
@@ -480,16 +560,19 @@ def test_skip_node_with_reason_counts_as_satisfied(client):
 
     # 跳过原因必填
     assert client.post(f"/admin/replays/{batch_id}/nodes/{n0['id']}/skip",
-                       json={"operator": LEAD, "role": "ops-lead"}
+                       json={"operator": LEAD, "role": "ops-lead",
+                             "delegation_id": delegate(client, "ops-lead", LEAD)}
                        ).status_code == 422
     # 发起人不能跳过自己的批次节点
     assert client.post(f"/admin/replays/{batch_id}/nodes/{n0['id']}/skip",
                        json={"operator": SUBMITTER, "role": "ops-lead",
+                             "delegation_id": delegate(client, "ops-lead", SUBMITTER),
                              "reason": "x"}).status_code == 403
 
     # 有理由跳过：节点视为满足，串行链推进到下一节点
     r = client.post(f"/admin/replays/{batch_id}/nodes/{n0['id']}/skip",
                     json={"operator": LEAD, "role": "ops-lead",
+                          "delegation_id": delegate(client, "ops-lead", LEAD),
                           "reason": "主管休假，值班经理代签已电话确认"})
     assert r.status_code == 200
     assert r.json()["result"] == "skipped"
@@ -546,7 +629,9 @@ def test_policy_update_does_not_change_submitted_batches(client):
 
     # 已提交批次仍按 v1 的链审批：cto 角色对它无效，ops-lead 有效
     n0 = ap_a["nodes"][0]
-    assert approve_node(client, batch_a, n0["id"], FINANCE, "cto").status_code == 403
+    assert raw_approve_node(
+        client, batch_a, n0["id"], FINANCE, "cto",
+        delegation_id=delegate(client, "cto", FINANCE)).status_code == 403
     assert approve_node(client, batch_a, n0["id"], LEAD, "ops-lead").status_code == 200
     n1 = node_by_seq(client, batch_a, 1)
     assert n1["status"] == "active" and n1["role"] == "finance-controller"
@@ -579,7 +664,9 @@ def test_size_based_rules_and_normal_default_allow(client):
     # SZ-1 被上一批占住，先拒绝上一批释放占用
     n0 = node_by_seq(client, big_batch, 0)
     client.post(f"/admin/replays/{big_batch}/nodes/{n0['id']}/reject",
-                json={"operator": LEAD, "role": "ops-lead", "reason": "改期"})
+                json={"operator": LEAD, "role": "ops-lead",
+                      "delegation_id": delegate(client, "ops-lead", LEAD),
+                      "reason": "改期"})
     r = submit(client, external_id="SZ-1")
     assert r.status_code == 201
     assert r.json()["status"] == "running"
@@ -642,8 +729,10 @@ def test_duplicate_and_racing_decisions_have_no_second_effect(client):
     assert event_types(client, batch_id).count("replay_approval_node_approved") == 1
 
     # 同一节点批准后再拒绝：409，批次不被推翻
+    # 同一节点批准后再拒绝：409，批次不被推翻（委托存在与否都被节点状态挡下）
     assert client.post(f"/admin/replays/{batch_id}/nodes/{n0['id']}/reject",
                        json={"operator": SECURITY, "role": "ops-lead",
+                             "delegation_id": delegate(client, "ops-lead", SECURITY),
                              "reason": "late"}).status_code == 409
     assert detail(client, batch_id)["batch"]["status"] == "pending_approval"
 
@@ -684,11 +773,13 @@ def test_concurrent_decision_on_same_node_settles_once(client):
 
     from app.replay import decide_node
     db = client.app.state.db
-    r1 = decide_node(db, batch_id, n0["id"], "approve", LEAD, "ops-lead")
+    lead_d = delegate(client, "ops-lead", LEAD)
+    finance_d = delegate(client, "ops-lead", FINANCE)
+    r1 = decide_node(db, batch_id, n0["id"], "approve", LEAD, "ops-lead", lead_d)
     assert r1["result"] == "approved"
     # 第二个决定到达时节点已非 active：409，不产生第二条决定事件
     with pytest.raises(Exception) as excinfo:
-        decide_node(db, batch_id, n0["id"], "approve", FINANCE, "ops-lead")
+        decide_node(db, batch_id, n0["id"], "approve", FINANCE, "ops-lead", finance_d)
     assert "409" in str(excinfo.value)
     assert event_types(client, batch_id).count("replay_approval_node_approved") == 1
     assert node_by_seq(client, batch_id, 0)["decided_by"] == LEAD
