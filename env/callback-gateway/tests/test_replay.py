@@ -388,6 +388,78 @@ def test_cancel_stops_pending_tasks_and_stuck_effects(tmp_path):
         assert {"replay_batch_created", "replay_batch_cancelled", "effect_cancelled"} <= types
 
 
+def test_cancel_while_processing_keeps_task_cancelled(tmp_path):
+    """处理中的任务被取消：迟到的完成结果不得覆盖 cancelled，不落副作用、不写完成记录。"""
+    app = make_app(tmp_path)
+    with TestClient(app) as c:
+        process_normally(c, "RC-FLY", b'{"order": 1}')
+        batch_id = submit(c, external_id="RC-FLY").json()["batch_id"]
+
+        # handler 执行期间（占位事务已提交、收尾事务未开始）运营取消批次
+        def cancel_midway(delivery):
+            r = c.post(f"/admin/replays/{batch_id}/cancel",
+                       json={"operator": "ops-li", "note": "改走线下处理"})
+            assert r.status_code == 200
+            return business_handler(delivery)
+
+        c.app.state.replay_worker.handler = cancel_midway
+        c.app.state.replay_worker.run_once()
+
+        # 任务保持 cancelled：不被迟到的 done 覆盖，批次计数不被污染
+        task = get_task(c, batch_id, "RC-FLY")
+        assert task["status"] == "cancelled"
+        batch = c.get(f"/admin/replays/{batch_id}").json()["batch"]
+        assert batch["status"] == "cancelled"
+        assert batch["done"] == 0 and batch["cancelled"] == 1
+
+        # 没有写入任何重放副作用，也没有完成记录（仅留一条 discarded 审计）
+        db = c.app.state.db
+        assert db.query_one("SELECT COUNT(*) AS c FROM outbox WHERE replay_task_id=?",
+                            (task["id"],))["c"] == 0
+        events = c.get(f"/admin/replays/{batch_id}/events").json()["events"]
+        types = [e["type"] for e in events]
+        assert "replay_task_done" not in types
+        assert "replay_batch_cancelled" in types
+        discarded = next(e for e in events
+                         if e["type"] == "replay_task_completion_discarded")
+        assert discarded["detail"]["task_status"] == "cancelled"
+
+        # 派发器也无可派发：下游只有正常处理那一次效果
+        c.app.state.worker.run_once()
+        assert db.query_one("SELECT COUNT(*) AS c FROM sink_effects")["c"] == 1
+
+
+def test_cancel_while_processing_then_handler_fails_keeps_cancelled(tmp_path):
+    """处理中的任务被取消后 handler 才失败：不标记 failed、不安排重试、不会复活。"""
+    app = make_app(tmp_path, max_attempts=3)
+    with TestClient(app) as c:
+        process_normally(c, "RC-FLY2", b'{"order": 2}')
+        batch_id = submit(c, external_id="RC-FLY2").json()["batch_id"]
+
+        def cancel_then_fail(delivery):
+            r = c.post(f"/admin/replays/{batch_id}/cancel", json={"operator": "ops-li"})
+            assert r.status_code == 200
+            raise TransientError("下游又挂了")
+
+        c.app.state.replay_worker.handler = cancel_then_fail
+        c.app.state.replay_worker.run_once()
+
+        # 保持 cancelled：不被 failed 覆盖，也不退回 pending 等待重试
+        task = get_task(c, batch_id, "RC-FLY2")
+        assert task["status"] == "cancelled"
+        assert task["next_retry_at"] is None
+
+        events = c.get(f"/admin/replays/{batch_id}/events").json()["events"]
+        types = [e["type"] for e in events]
+        assert "replay_task_failed" not in types
+        assert "replay_task_retry_scheduled" not in types
+        assert "replay_task_completion_discarded" in types
+
+        # 再跑 worker 也不会复活已取消的任务
+        c.app.state.replay_worker.run_once()
+        assert get_task(c, batch_id, "RC-FLY2")["status"] == "cancelled"
+
+
 # ---- 失败：单独重试，不阻塞其他编号 -------------------------------------------
 
 def test_failed_task_retried_individually_without_blocking_others(tmp_path):

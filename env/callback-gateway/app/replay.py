@@ -8,6 +8,8 @@
   提交带 request_id 时重复提交返回原批次；跨批存在活动任务（pending/processing）
   的投递会被跳过（已完成的批次不阻塞以后再次重放——那是有意为之的新批次）；
 - 批次可暂停/继续/取消；取消时未执行的任务与滞留的待派发副作用同事务取消；
+  正在处理的任务同样标记 cancelled，其迟到的完成/失败结果落库时被条件更新
+  挡下（保持 cancelled，不落副作用、不写完成记录），审计留 discarded 事件；
 - 重启后 recover() 把卡在 processing 的任务退回 pending，从上次位置（attempts/
   checkpoint/next_retry_at 都落库）继续；
 - 失败按指数退避单独重试，超限标记 failed，可人工单条重试，不阻塞其他编号；
@@ -287,7 +289,9 @@ def resume(db: Database, batch_id: int, operator: str) -> dict:
 
 
 def cancel(db: Database, batch_id: int, operator: str, note: str = "") -> dict:
-    """取消：未执行的任务标记 cancelled；已完成任务滞留的待派发副作用同事务取消
+    """取消：未执行的任务标记 cancelled；正在处理的任务一并标记，其迟到的
+    完成/失败结果落库时会被 worker 的条件更新挡下（保持 cancelled，不再写
+    完成记录或派发副作用）；已完成任务滞留的待派发副作用同事务取消
     （已派发的外部效果无法撤回，审计里保留完整轨迹）。"""
     now = time.time()
     with db.tx() as cur:
@@ -482,6 +486,25 @@ class ReplayWorker:
 
         now = self.clock()
         with self.db.tx() as cur:
+            # 条件更新落终态：handler 执行期间批次可能已被取消（任务 processing->
+            # cancelled）。更新不到说明任务已不属于本次执行——保持 cancelled，
+            # 丢弃迟到的结果：不落副作用、不写完成记录、不计进度
+            finalized = cur.execute(
+                """UPDATE replay_tasks SET status='done', checkpoint=?, next_retry_at=NULL,
+                   finished_at=?, updated_at=? WHERE id=? AND status='processing'""",
+                (json.dumps(result.get("checkpoint") or {}, ensure_ascii=False),
+                 now, now, task_id),
+            ).rowcount
+            if not finalized:
+                current = cur.execute("SELECT status FROM replay_tasks WHERE id=?",
+                                      (task_id,)).fetchone()
+                audit.record(cur, "replay_task_completion_discarded",
+                             task["external_id"], task["delivery_id"],
+                             {"replay_batch_id": task["batch_id"],
+                              "replay_task_id": task_id, "attempt": attempt,
+                              "task_status": current["status"] if current else None},
+                             ts=now)
+                return
             for effect in result.get("effects", []):
                 key = replay_effect_key(task_id, effect["type"], effect["payload"])
                 cur.execute(
@@ -492,12 +515,6 @@ class ReplayWorker:
                     (task["delivery_id"], task_id, effect["type"], key,
                      json.dumps(effect["payload"], ensure_ascii=False, sort_keys=True), now),
                 )
-            cur.execute(
-                """UPDATE replay_tasks SET status='done', checkpoint=?, next_retry_at=NULL,
-                   finished_at=?, updated_at=? WHERE id=?""",
-                (json.dumps(result.get("checkpoint") or {}, ensure_ascii=False),
-                 now, now, task_id),
-            )
             audit.record(cur, "replay_task_done", task["external_id"], task["delivery_id"],
                          {"replay_batch_id": task["batch_id"], "replay_task_id": task_id,
                           "attempt": attempt,
@@ -508,6 +525,19 @@ class ReplayWorker:
     def _handle_failure(self, task, attempt: int, exc: Exception, now: float):
         task_id = task["id"]
         with self.db.tx() as cur:
+            # 与成功收尾同一守卫：处理期间被取消的任务保持 cancelled，
+            # 不标记失败、不安排重试（否则会把已取消的任务复活回队列）
+            still_processing = cur.execute(
+                "SELECT 1 AS x FROM replay_tasks WHERE id=? AND status='processing'",
+                (task_id,),
+            ).fetchone()
+            if still_processing is None:
+                audit.record(cur, "replay_task_completion_discarded",
+                             task["external_id"], task["delivery_id"],
+                             {"replay_batch_id": task["batch_id"],
+                              "replay_task_id": task_id, "attempt": attempt,
+                              "error": str(exc)}, ts=now)
+                return
             if attempt >= self.settings.max_attempts:
                 # 连续失败 -> 标记 failed，只影响这一条，其他编号照常执行
                 cur.execute(
