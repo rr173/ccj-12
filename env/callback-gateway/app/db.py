@@ -7,6 +7,7 @@
 - outbox           外部副作用的发件箱（幂等键保证 exactly-once）
 - sink_effects     模拟下游系统的已应用记录（下游按幂等键去重）
 - events           只增不删的审计日志（签名/冲突/重试/处置全部可查）
+- key_config_versions  密钥配置每次切换/尝试的记录（版本、操作者、时间、结果）
 """
 from __future__ import annotations
 
@@ -79,6 +80,17 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_events_ext ON events(external_id);
+
+-- 密钥配置轮换记录：每次提交（无论成败）一条，重启后据此恢复最后一次成功配置
+CREATE TABLE IF NOT EXISTS key_config_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version     INTEGER,               -- applied 时的新版本号（单调递增）；rejected 为 NULL
+    result      TEXT NOT NULL,         -- applied | rejected
+    config      TEXT,                  -- applied：规范化后的配置 JSON；rejected：原始提交内容
+    operator    TEXT NOT NULL,
+    reason      TEXT,                  -- rejected 的校验失败原因（JSON 数组）
+    created_at  REAL NOT NULL
+);
 """
 
 

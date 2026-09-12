@@ -24,7 +24,8 @@
 
 | 需求 | 实现 |
 |---|---|
-| 可轮换签名密钥，旧钥匙过渡期可用 | 密钥环 JSON：`active` + `retired`（带 `grace_until`），见 `app/security.py` |
+| 可轮换签名密钥，旧钥匙过渡期可用 | 密钥配置：`active` + `retired`（带 `grace_until`），见 `app/security.py` |
+| 不重启热轮换、原子切换、版本可查 | `POST /admin/keys/rotate` 校验→落库→整份替换内存密钥环；`GET /admin/keys/current` / `/admin/keys/versions`，见 `app/keyconfig.py` |
 | 同编号同内容只处理一次 | `deliveries UNIQUE(external_id, content_hash)`，重复投递返回 `duplicate`，见 `app/ingest.py` |
 | 同编号不同内容冻结、人工比较选择、不覆盖 | 新版本独立落盘并整组 `frozen=1`，开冲突单；任何版本都不会被覆盖，见 `app/ingest.py`、`app/admin.py` |
 | 落盘后才 ACK | 所有写入单事务提交（WAL + `synchronous=FULL`），提交后才返回响应 |
@@ -46,7 +47,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 13 个端到端测试
+python -m pytest tests/          # 32 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -69,11 +70,40 @@ curl -X POST http://localhost:8000/callbacks \
   `202 conflict`（同编号不同内容，已冻结待人工处置）/ `401`（验签失败，已记审计）。
 - **只有数据可靠落盘后才会收到 2xx**；未收到 2xx 时请原样重发（幂等保证不会重复处理）。
 
-## 密钥轮换
+## 密钥轮换（不重启）
 
-1. 生成新密钥，加入 `keys.json` 为 `active`；旧密钥改为 `retired` 并设 `grace_until`（过渡期截止）。
-2. 通知接入方切到新 `kid` 签发。过渡期内旧钥匙签名仍被接受（审计中会记录使用的 `kid`）。
-3. 过渡期结束后旧钥匙一律拒绝（`retired_key_grace_expired`）。
+运营通过管理端点提交新密钥配置，**校验通过才切换，且整份一次性生效**——正在处理的
+请求只会看到完整的旧配置或完整的新配置。每次提交（无论成败）都记录配置版本、
+操作者、时间和结果；重启后自动恢复最后一次成功应用的配置。
+
+```bash
+# 查看当前生效的配置版本（密钥明文打码，永不回显）
+curl localhost:8000/admin/keys/current
+
+# 提交新配置：k3 成为新签发密钥，k2 退为过渡密钥，k1 立即失效
+curl -X POST localhost:8000/admin/keys/rotate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "operator": "ops-li",
+    "keys": [
+      {"kid": "k3", "secret": "new-secret-3", "status": "active"},
+      {"kid": "k2", "secret": "new-secret-2", "status": "retired", "grace_until": "2026-10-01T00:00:00Z"},
+      {"kid": "k1", "secret": "old-secret-1", "status": "retired", "grace_until": "2020-01-01T00:00:00Z"}
+    ]
+  }'
+# -> {"result": "applied", "version": 2}
+
+# 查看每次切换/尝试的记录（含被拒绝的提交及原因）
+curl localhost:8000/admin/keys/versions
+```
+
+- 校验规则：必须是 `{"keys": [...]}` 且非空；`kid` 非空不重复；`secret` 非空；
+  至少一个 `active` 密钥；`retired` 密钥必须带合法的 `grace_until`（ISO-8601 时间）。
+  任何一条不满足 → `422` + 具体原因，**当前配置原样保留**，失败也落审计。
+- 切换语义：先在事务里写入新版本记录并提交，再原子替换内存密钥环；崩溃重启后
+  从数据库恢复最后一次 `applied` 配置（首次启动用 `keys.json` 引导为第 1 版）。
+- 过渡期内旧密钥签名仍被接受（审计记录使用的 `kid`）；超过 `grace_until` 一律
+  拒绝（`retired_key_grace_expired`）。
 
 ## 人工处置
 
@@ -101,7 +131,7 @@ curl 'localhost:8000/admin/events?external_id=A-1001'
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `DATABASE_PATH` | `/data/gateway.db` | SQLite 路径（容器挂卷持久化） |
-| `KEYS_FILE` | `/config/keys.json` | 密钥环文件 |
+| `KEYS_FILE` | `/config/keys.json` | 密钥配置文件（仅首次启动引导用；之后以库中最后成功配置为准，轮换走 `/admin/keys/rotate`） |
 | `RETRY_BASE_SECONDS` | `5` | 重试间隔基数（指数退避） |
 | `RETRY_CAP_SECONDS` | `300` | 重试间隔上限 |
 | `MAX_ATTEMPTS` | `5` | 连续失败上限，超过进隔离队列 |

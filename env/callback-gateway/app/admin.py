@@ -1,4 +1,4 @@
-"""人工处置层：冲突比较/选定、隔离重投、审计查询。
+"""人工处置层：冲突比较/选定、隔离重投、审计查询、密钥热轮换。
 
 人工选定某份内容后，该版本从它落盘时记录的 checkpoint 位置继续处理，
 全程动作写审计日志，可追溯。
@@ -8,11 +8,13 @@ from __future__ import annotations
 import json
 import time
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from . import audit
 from .db import Database
+from .keyconfig import KeyRotationService
 
 
 def _row_to_dict(row) -> dict:
@@ -30,8 +32,30 @@ class RequeueRequest(BaseModel):
     note: str = ""
 
 
-def create_admin_router(db: Database) -> APIRouter:
+def create_admin_router(db: Database, keys: KeyRotationService) -> APIRouter:
     router = APIRouter(prefix="/admin", tags=["admin"])
+
+    # ---- 签名密钥热轮换 ----------------------------------------------------
+
+    @router.get("/keys/current")
+    def current_key_config():
+        """当前生效的密钥配置版本（密钥明文打码，永不回显）。"""
+        return keys.current()
+
+    @router.get("/keys/versions")
+    def key_config_versions(limit: int = Query(100, le=1000)):
+        """每次轮换提交的记录：版本、操作者、时间、结果（含被拒绝的提交）。"""
+        return {"versions": keys.history(limit)}
+
+    @router.post("/keys/rotate")
+    async def rotate_keys(request: Request):
+        """提交新密钥配置并立即生效（不重启）。
+
+        请求体：{"operator": "操作人", "keys": [...]}（keys 格式同 keys.json）。
+        校验通过才切换且整份一次性生效；校验失败保留当前配置，两种结果都落审计。
+        """
+        status, payload = keys.rotate(await request.body())
+        return JSONResponse(status_code=status, content=payload)
 
     # ---- 投递查询 --------------------------------------------------------
 

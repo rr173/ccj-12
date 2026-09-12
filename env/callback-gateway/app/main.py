@@ -19,14 +19,19 @@ from .admin import create_admin_router
 from .config import Settings
 from .db import Database
 from .ingest import ingest
-from .security import KeyRing
+from .keyconfig import KeyConfigStore, KeyRotationService
+from .security import KeyRingManager
 from .worker import Worker
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     db = Database(settings.database_path)
-    keyring = KeyRing.from_file(settings.keys_file, settings.signature_tolerance_seconds)
+    # 启动加载最后一次成功应用的密钥配置（库里没有则用 KEYS_FILE 引导为第 1 版）
+    key_store = KeyConfigStore(db)
+    keyring = KeyRingManager(
+        key_store.bootstrap(settings.keys_file, settings.signature_tolerance_seconds))
+    keys = KeyRotationService(key_store, keyring)
     worker = Worker(db, settings)
 
     @contextlib.asynccontextmanager
@@ -43,6 +48,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="callback-gateway", lifespan=lifespan)
     app.state.db = db
     app.state.keyring = keyring
+    app.state.keys = keys
     app.state.worker = worker
     app.state.settings = settings
 
@@ -73,7 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def healthz():
         return {"status": "ok", "time": time.time()}
 
-    app.include_router(create_admin_router(db))
+    app.include_router(create_admin_router(db, keys))
     return app
 
 
