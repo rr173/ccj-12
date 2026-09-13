@@ -28,6 +28,7 @@ import time
 
 from . import notif_policy
 from . import notifications as notif
+from . import notif_reconciliation
 from . import notif_routing
 from . import receipts
 from .config import Settings
@@ -79,8 +80,11 @@ class NotificationWorker:
 
     def recover(self) -> int:
         """启动恢复：崩溃时卡在 in_flight 的路由发送任务退回 pending（尝试历史、
-        熔断窗口与通道快照都在库里，重启后不会对已成功通道重发）。"""
-        return notif_routing.recover_in_flight_tasks(self.db, self.clock())
+        熔断窗口与通道快照都在库里，重启后不会对已成功通道重发）；对账扫描中任务
+        退回队列并从游标继续。"""
+        recovered = notif_routing.recover_in_flight_tasks(self.db, self.clock())
+        notif_reconciliation.recover_reconciliation_jobs(self.db, self.clock())
+        return recovered
 
     def run_once(self):
         now = self.clock()
@@ -102,6 +106,11 @@ class NotificationWorker:
             self.db, self.senders, self.settings, now)
         # 7) 送达确认：无回执的消息超时标待确认，按策略故障转移重试或转人工
         receipts.scan_confirmations(self.db, now)
-        # 8) 回执驱动重排的任务立即在本轮补发（下一道通道）
+        # 8) 人工确认的补偿发送计划只在此处转成既有发送任务调度（不直接外发）；
+        #    若并发回执/发送已产生外部成功效果，计划保持 superseded，绝不重复发送
+        notif_reconciliation.process_compensation_plans(self.db, now)
+        # 9) 回执驱动重排与补偿计划任务立即在本轮补发（下一道通道）
         notif_routing.dispatch_due_tasks(
             self.db, self.senders, self.settings, now)
+        # 10) 通知状态只读对账：分页推进运营发起的对账任务（暂停分片不会被取走）
+        notif_reconciliation.process_due_jobs(self.db, now)

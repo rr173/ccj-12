@@ -88,6 +88,12 @@
                     驱动的通道切换只复用本任务的预占（generation 不变不重复占用），
                     取消/人工忽略/确认不再发送时回收（reserved->released），发送成功
                     转 consumed；窗口到期后旧窗口行不再计入消耗（等同释放可用额度）
+- notif_reconciliation_jobs / notif_reconciliation_findings  通知状态对账：运营按接收人、
+                    事件、时间范围与状态发起只读扫描；异常保存检测时的不可变快照、原因、
+                    当时规则版本与可用补偿。任务可分页、暂停/继续、失败重试，重启恢复
+- notif_reconciliation_compensations / notif_compensation_send_plans  对账补偿：重新关联
+                    回执、释放孤儿预占、关闭不再发送任务、创建补偿发送计划；所有补偿幂等，
+                    补偿前/后状态与依据随操作留痕，不改写原始回执和历史审计
 """
 from __future__ import annotations
 
@@ -981,6 +987,115 @@ CREATE INDEX IF NOT EXISTS idx_quota_reserv_bucket
 CREATE INDEX IF NOT EXISTS idx_quota_reserv_task ON notif_quota_reservations(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_quota_reserv_window
     ON notif_quota_reservations(recipient, bucket_start);
+
+-- 通知状态对账任务：一次运营发起的只读扫描。扫描条件与检测时的路由/额度/回执策略版本
+-- 一并固化；任务本身可分页推进、暂停后继续、失败重试，服务重启后从游标恢复。
+CREATE TABLE IF NOT EXISTS notif_reconciliation_jobs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    operator      TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'queued', -- queued|scanning|paused|completed|failed
+    filters_json  TEXT NOT NULL DEFAULT '{}',
+    route_version INTEGER,
+    quota_version INTEGER,
+    receipt_policy_json TEXT NOT NULL DEFAULT '{}',
+    cursor_task_id INTEGER NOT NULL DEFAULT 0,
+    cursor_message_id INTEGER NOT NULL DEFAULT 0,
+    cursor_receipt_id INTEGER NOT NULL DEFAULT 0,
+    cursor_reservation_id INTEGER NOT NULL DEFAULT 0,
+    phase         TEXT NOT NULL DEFAULT 'tasks',    -- tasks|messages|receipts|reservations|done
+    scanned_count INTEGER NOT NULL DEFAULT 0,
+    findings_count INTEGER NOT NULL DEFAULT 0,
+    page_size     INTEGER NOT NULL DEFAULT 100,
+    last_error    TEXT,
+    paused_by     TEXT,
+    paused_at     REAL,
+    resumed_count INTEGER NOT NULL DEFAULT 0,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    next_retry_at REAL,
+    started_at    REAL,
+    completed_at  REAL,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_recon_jobs_status
+    ON notif_reconciliation_jobs(status, updated_at);
+
+-- 对账异常：snapshot_json 是检测瞬间各链路实体的不可变快照；reason 是稳定异常代码。
+-- anomaly_key 在同一 job 内去重，规则版本变化后重新对账会产生新 job/新 finding，绝不回改。
+CREATE TABLE IF NOT EXISTS notif_reconciliation_findings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id        INTEGER NOT NULL REFERENCES notif_reconciliation_jobs(id),
+    anomaly_key   TEXT NOT NULL,
+    entity_type   TEXT NOT NULL,                  -- task|receipt|reservation|message
+    entity_id     INTEGER NOT NULL,
+    severity      TEXT NOT NULL DEFAULT 'warning', -- info|warning|critical
+    reason        TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'open',    -- open|compensating|resolved|ignored|failed
+    recipient     TEXT,
+    event_id      INTEGER,
+    event_type    TEXT,
+    send_task_id  INTEGER,
+    receipt_id    INTEGER,
+    reservation_id INTEGER,
+    message_pk    INTEGER,
+    snapshot_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    suggested_actions_json TEXT NOT NULL DEFAULT '[]',
+    detected_at   REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    UNIQUE (job_id, anomaly_key)
+);
+CREATE INDEX IF NOT EXISTS idx_notif_recon_findings_job
+    ON notif_reconciliation_findings(job_id, id);
+CREATE INDEX IF NOT EXISTS idx_notif_recon_findings_query
+    ON notif_reconciliation_findings(recipient, event_type, status, reason);
+CREATE INDEX IF NOT EXISTS idx_notif_recon_findings_entity
+    ON notif_reconciliation_findings(entity_type, entity_id);
+
+-- 人工补偿动作：每次选择都记录依据（finding 快照）、操作者、动作前后状态和结果。
+-- UNIQUE(finding_id,action) 语义由应用在写事务中检查成功动作保证幂等；失败尝试允许保留多行。
+CREATE TABLE IF NOT EXISTS notif_reconciliation_compensations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id        INTEGER NOT NULL REFERENCES notif_reconciliation_jobs(id),
+    finding_id    INTEGER NOT NULL REFERENCES notif_reconciliation_findings(id),
+    action        TEXT NOT NULL,                  -- relink_receipt|release_reservation|close_task|create_send_plan
+    operator      TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'applied', -- applied|noop|failed|scheduled
+    target_type   TEXT NOT NULL,                  -- receipt|reservation|task|send_plan
+    target_id     INTEGER,
+    request_json  TEXT NOT NULL DEFAULT '{}',
+    before_json   TEXT NOT NULL DEFAULT '{}',
+    after_json    TEXT NOT NULL DEFAULT '{}',
+    basis_snapshot_json TEXT NOT NULL,
+    reason        TEXT,
+    error         TEXT,
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_recon_comp_job
+    ON notif_reconciliation_compensations(job_id, id);
+CREATE INDEX IF NOT EXISTS idx_notif_recon_comp_target
+    ON notif_reconciliation_compensations(target_type, target_id);
+
+-- 补偿发送计划：只调度，不直接外发；由既有 notif_send_tasks 的单赢家领取、额度预占和
+-- 通道尝试幂等保护执行。plan_key 保证同一异常/任务的计划重复提交不会产生第二次意图。
+CREATE TABLE IF NOT EXISTS notif_compensation_send_plans (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id    INTEGER NOT NULL REFERENCES notif_reconciliation_findings(id),
+    job_id        INTEGER NOT NULL REFERENCES notif_reconciliation_jobs(id),
+    task_id       INTEGER NOT NULL REFERENCES notif_send_tasks(id),
+    plan_key      TEXT NOT NULL UNIQUE,
+    status        TEXT NOT NULL DEFAULT 'scheduled', -- scheduled|applied|superseded|cancelled
+    operator      TEXT NOT NULL,
+    note          TEXT,
+    scheduled_at  REAL NOT NULL,
+    applied_at    REAL,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_comp_plan_status
+    ON notif_compensation_send_plans(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_notif_comp_plan_task
+    ON notif_compensation_send_plans(task_id, status);
 """
 
 

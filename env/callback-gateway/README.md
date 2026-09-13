@@ -54,6 +54,11 @@
                 │   乱序不回退终态；匹配不上的回执进待核对队列（可绑定）  │
                 │   超时扫描 -> 计划快照故障转移重试 -> 超限/策略转人工   │
                 │   原文/历史/队列多维查询；存证原文安全重放，无二次效果  │
+                ├────────────────────────────────────────────────────┤
+                │ 通知状态对账与补偿  /admin/approval-notifications/reconciliation │
+                │   按接收人/事件/时间/状态只读扫描；快照固化异常与规则版本       │
+                │   分页、暂停继续、失败重试、重启恢复；补偿幂等且不改正文/审计   │
+                │   重关联回执·释放孤儿预占·关闭任务·创建补偿发送计划            │
                 └────────────────────────────────────────────────────┘
 ```
 
@@ -136,6 +141,7 @@
 | 超额延迟/降级站内/转人工与稳定占用顺序 | delay：任务挂到窗口结束（`quota_status=delayed`，窗口到期落入新桶即释放额度）；downgrade：计划改为仅 inbox，记不计桶消耗的 downgraded 预占；manual：任务 awaiting_manual，`.../quota/tasks/{id}/resolve` retry/ignore；同接收人多事件按 (ordinal,id) 领取且低序号等待任务未预占时高序号不允许插队（notif_quota_order_wait） |
 | 取消/忽略/确认不再发送回收预占；重启可恢复 | `cancel_task_tx` 与人工 ignore 把未使用预占 reserved→released；发送成功转 consumed（窗口内不释放）；窗口到期旧桶行不再计入消耗；recover 把 in_flight 退回 pending 时保留其预占复用并对账回收孤儿预占 |
 | 查询额度版本/当前消耗/预占/被延迟降级人工任务/审计 | `GET .../quota/current`·`/versions`(+`/versions/{id}`)、`/usage`（规则×接收人×窗口 used/reserved/consumed/available/window_ends_at）、`/reservations`、`/tasks`（quota_status 过滤）、`POST /rollback`、`POST /tasks/{id}/resolve`；审计走 `events`（`notif_quota_*`） |
+| 通知状态对账与幂等补偿 | 运营按接收人/事件/时间/状态发起 `POST .../reconciliation/jobs` 只读扫描；任务、尝试、预占、message_id 与回执的矛盾在检测事务中固化不可变快照/原因/规则版本；任务分页、暂停继续、失败重试、重启恢复；可重关联已有回执、释放无外部成功效果的孤儿预占、关闭不再发送任务、创建补偿发送计划；补偿前后状态、操作者、依据和审计在 `/findings/{id}`、`/compensations`、`/send-plans` 可查，见 `app/notif_reconciliation.py` |
 | Docker 部署 | `Dockerfile` + `docker-compose.yml` |
 
 ## 快速开始
@@ -149,7 +155,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 端到端测试（回执模块 31 个，全套 239 个）
+python -m pytest tests/          # 端到端测试（全套 261 个）
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -1019,6 +1025,70 @@ curl -X POST localhost:8000/admin/approval-notifications/routing/tasks/12/receip
   `receipt_policy_set`、`receipt_key_rotated/retired/seeded`、
   `external_message_id_collision`，全部走只增的 `events` 表。
 
+
+## 通知状态对账与补偿
+
+在路由发送、通道尝试、额度预占、外部 message_id、回执和审计链路之上，运营可以发起
+**只读、可分页续跑的状态对账**，并在人工确认后执行幂等补偿
+（`app/notif_reconciliation.py`）。
+
+```bash
+BASE=/admin/approval-notifications/reconciliation
+# 1) 发起只读对账：至少给一个范围条件；page_size 控制每轮扫描分片
+curl -X POST localhost:8000/$BASE/jobs -H 'Content-Type: application/json' -d '{
+  "operator":"ops-audit",
+  "recipient":"ops-wang",
+  "event_type":"activated",
+  "time_from":"2026-09-13T00:00:00Z",
+  "time_to":"2026-09-14T00:00:00Z",
+  "status":"quarantined",
+  "page_size":100
+}'
+
+# 2) 分页查看任务与异常（offset 分页；暂停后可继续，失败可重试，重启自动从游标恢复）
+curl localhost:8000/$BASE/jobs
+curl localhost:8000/$BASE/jobs/1
+curl -X POST localhost:8000/$BASE/jobs/1/pause -d '{"operator":"ops-audit","reason":"先与供应商核对"}'
+curl -X POST localhost:8000/$BASE/jobs/1/resume -d '{"operator":"ops-audit"}'
+curl -X POST localhost:8000/$BASE/jobs/1/retry -d '{"operator":"ops-audit"}'
+curl 'localhost:8000/$BASE/jobs/1/findings?status=open&limit=50&offset=100'
+curl localhost:8000/$BASE/jobs/1/events
+curl localhost:8000/$BASE/findings/88        # 检测时快照、证据、建议动作、补偿历史
+
+# 3) 人工选择补偿；重复提交返回已有补偿，不产生第二次效果
+curl -X POST localhost:8000/$BASE/findings/88/compensations/relink_receipt \
+  -d '{"operator":"ops-audit","receipt_id":12,"message_pk":9}'
+curl -X POST localhost:8000/$BASE/findings/89/compensations/release_reservation \
+  -d '{"operator":"ops-audit"}'
+curl -X POST localhost:8000/$BASE/findings/90/compensations/close_task \
+  -d '{"operator":"ops-audit","note":"业务确认不再发送"}'
+curl -X POST localhost:8000/$BASE/findings/91/compensations/create_send_plan \
+  -d '{"operator":"ops-audit","note":"未产生外部效果，补发"}'
+
+# 4) 查询补偿前后状态、操作者、依据快照、审计与补偿发送计划
+curl 'localhost:8000/$BASE/compensations?job_id=1&operator=ops-audit'
+curl 'localhost:8000/$BASE/send-plans?task_id=32'
+```
+
+- **只读检测与不可变快照**：扫描按 tasks → receipts → reservations 三个游标分片推进。
+  每个 finding 保存检测瞬间的发送任务、尝试、切换、预占、外部消息和回执快照、明确异常
+  代码、证据、建议动作以及当时的路由版本、额度版本、回执策略。之后规则发布/回滚只影响
+  新对账，绝不回改已有 job/finding。
+- **暂停/失败/重启**：worker 每轮只取完整分片；暂停在分片边界生效。失败保留
+  `last_error` 并延迟重试，游标不回退；服务重启把 `scanning` 安全退回 `queued`，已插入
+  finding 由 `(job_id,anomaly_key)` 去重，继续后不会重复生成异常。
+- **重新关联回执**：只允许选择已有的回执与外部消息，原始 `raw_body`、message_id、event
+  与历史审计不改写；关联后复用回执终态状态机。已经成功应用的重复补偿返回既有动作。
+- **释放孤儿预占**：仅释放当前仍为 `reserved`、且任务没有外部 message_id 或 email/webhook
+  成功尝试的预占；已被外部商接受的效果不会因对账错误释放或重发。
+- **关闭不再发送任务**：仅关闭开放状态任务并释放未用预占，保留尝试、消息、回执与审计；
+  `sent/cancelled` 不再改变。
+- **补偿发送计划**：只对没有外部成功效果的任务创建计划。worker 先把计划应用为既有
+  `notif_send_tasks` 的一次新调度（新 round / 新 quota generation），随后仍由单赢家领取、
+  原子额度预占、通道尝试和 message_id 幂等链路外发。若并发回执/发送已产生外部成功效果，
+  计划转为 `superseded`，绝不再次发送。
+- **审计**：`notif_reconciliation_*` 与 `notif_compensation_plan_*` 事件全部进入只增
+  `events`；补偿行保存 operator、request、before/after、finding 依据快照、结果和错误。
 
 ## 配置（环境变量）
 

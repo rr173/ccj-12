@@ -28,6 +28,7 @@ from .keyconfig import KeyConfigStore, KeyRotationService
 from .notif_worker import NotificationWorker
 from .notif_policy import create_notif_policy_router
 from .notif_quota import create_quota_router
+from .notif_reconciliation import create_reconciliation_router
 from .notif_routing import configure_routing, create_routing_router
 from .notifications import create_notifications_router
 from . import receipts
@@ -126,6 +127,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db, settings, lambda: notif_worker.senders))
     # 接收人通知额度与抑制窗口：版本化配置、原子预占、超额延迟/降级/转人工
     app.include_router(create_quota_router(db, settings))
+    # 通知状态对账与补偿：只读快照、分页/暂停/恢复/重启续跑、幂等人工补偿
+    app.include_router(create_reconciliation_router(db))
     # 外部通道回执：公共验签接入口 + 管理员查询/绑定/重放/策略
     app.include_router(create_receipts_public_router(db))
     app.include_router(create_receipts_admin_router(db, settings))
