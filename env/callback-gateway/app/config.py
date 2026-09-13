@@ -36,6 +36,16 @@ class Settings:
     notif_breaker_failure_threshold: int = 5
     notif_breaker_cooldown_seconds: float = 30.0
     notif_channel_timeout_seconds: float = 10.0
+    # 外部通道回执与送达确认：发送成功后多久没有外部回执算「待确认」（缺省策略，可由
+    # /admin/receipt-policy 在线调整）；失败回执（bounced/complained/expired）或超时后
+    # 按当前策略自动沿通道计划重试（最多 confirm_max_retries 次）或转人工
+    receipt_confirm_timeout_seconds: float = 3600.0
+    receipt_confirm_max_retries: int = 2
+    # 外部回执入口（POST /receipts/{channel}）的引导签名密钥（按通道覆盖用
+    # RECEIPT_EMAIL_SECRET / RECEIPT_WEBHOOK_SECRET）；未配置时须先由管理员登记密钥，
+    # 回执验签一律 fail-closed
+    receipt_email_secret: str | None = None
+    receipt_webhook_secret: str | None = None
     # 是否随服务启动后台 worker（测试时可关闭，手动驱动）
     run_worker: bool = True
 
@@ -72,5 +82,13 @@ class Settings:
                 "NOTIF_BREAKER_COOLDOWN_SECONDS", cls.notif_breaker_cooldown_seconds)),
             notif_channel_timeout_seconds=float(os.environ.get(
                 "NOTIF_CHANNEL_TIMEOUT_SECONDS", cls.notif_channel_timeout_seconds)),
+            receipt_confirm_timeout_seconds=float(os.environ.get(
+                "RECEIPT_CONFIRM_TIMEOUT_SECONDS",
+                cls.receipt_confirm_timeout_seconds)),
+            receipt_confirm_max_retries=int(os.environ.get(
+                "RECEIPT_CONFIRM_MAX_RETRIES",
+                cls.receipt_confirm_max_retries)),
+            receipt_email_secret=os.environ.get("RECEIPT_EMAIL_SECRET"),
+            receipt_webhook_secret=os.environ.get("RECEIPT_WEBHOOK_SECRET"),
             run_worker=os.environ.get("RUN_WORKER", "true").lower() == "true",
         )

@@ -47,6 +47,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from . import audit, notifications as notif
+from . import receipts
 from .config import Settings
 from .db import Database
 
@@ -592,7 +593,8 @@ def cancel_task_tx(cur: sqlite3.Cursor, task_id: int, reason: str,
     cur.execute(
         """UPDATE notif_send_tasks SET status='cancelled', cancelled_reason=?,
            next_retry_at=NULL, updated_at=? WHERE id=?
-           AND status IN ('pending','in_flight','failed')""",
+           AND status IN ('pending','in_flight','failed','awaiting_manual',
+                          'awaiting_confirmation')""",
         (reason, now, task_id))
     # 若它占用了某通道的恢复探针，释放探针归属（通道回到 open，下轮重新探针）
     cur.execute(
@@ -612,7 +614,8 @@ def cancel_tasks_for_todo_tx(cur: sqlite3.Cursor, todo_id: int, reason: str,
     同口径，由待办处理/对账/停用/升级停止在同一事务内调用）。"""
     rows = cur.execute(
         "SELECT id FROM notif_send_tasks WHERE todo_id=? "
-        "AND status IN ('pending','in_flight','failed')", (todo_id,)).fetchall()
+        "AND status IN ('pending','in_flight','failed','awaiting_manual',"
+        "'awaiting_confirmation')", (todo_id,)).fetchall()
     n = 0
     for r in rows:
         if cancel_task_tx(cur, r["id"], reason, now):
@@ -763,14 +766,18 @@ def _inbox_send(task: sqlite3.Row) -> None:
 
 
 def _call_sender(task: sqlite3.Row, plan_item: dict, channel: str,
-                 senders: dict, timeout: float) -> tuple[str, str | None, float]:
-    """在工作线程里调用 sender 并强制超时。返回 (result, error, duration)。"""
+                 senders: dict, timeout: float) -> tuple[str, str | None, float, str | None]:
+    """在工作线程里调用 sender 并强制超时。
+
+    返回 (result, error, duration, message_id)。sender 可在成功时返回外部服务给出的
+    message_id（非空字符串）；返回 None/其他时由回执模块生成本地占位编号 local:...。
+    """
     if channel == CHANNEL_INBOX:
         fn, args = _inbox_send, (task,)
     else:
         sender = senders.get(channel)
         if sender is None:
-            return ATTEMPT_FAILURE, f"no sender configured for channel {channel!r}", 0.0
+            return ATTEMPT_FAILURE, f"no sender configured for channel {channel!r}", 0.0, None
         if channel == CHANNEL_EMAIL:
             fn, args = sender, (plan_item["address"], task["subject"], task["body"])
         else:
@@ -779,18 +786,19 @@ def _call_sender(task: sqlite3.Row, plan_item: dict, channel: str,
     start = time.monotonic()
     fut = _executor.submit(fn, *args)
     try:
-        fut.result(timeout=timeout)
+        ret = fut.result(timeout=timeout)
     except FuturesTimeout:
         return ATTEMPT_TIMEOUT, f"channel {channel} timed out after {timeout}s", \
-            time.monotonic() - start
+            time.monotonic() - start, None
     except Exception as exc:  # noqa: BLE001 - 任何外发异常都计入失败/熔断
-        return ATTEMPT_FAILURE, str(exc), time.monotonic() - start
-    return ATTEMPT_SUCCESS, None, time.monotonic() - start
+        return ATTEMPT_FAILURE, str(exc), time.monotonic() - start, None
+    message_id = ret.strip() if isinstance(ret, str) and ret.strip() else None
+    return ATTEMPT_SUCCESS, None, time.monotonic() - start, message_id
 
 
 def _record_attempt_tx(cur, *, task_id: int, channel: str, attempt_index: int,
                        round_no: int, probe: bool, result: str, duration: float,
-                       error: str | None, now: float) -> None:
+                       error: str | None, now: float) -> int:
     cur.execute(
         """INSERT INTO notif_send_attempts
            (task_id, channel, attempt_index, round, probe, result, duration,
@@ -798,6 +806,7 @@ def _record_attempt_tx(cur, *, task_id: int, channel: str, attempt_index: int,
            VALUES (?,?,?,?,?,?,?,?,?)""",
         (task_id, channel, attempt_index, round_no, 1 if probe else 0,
          result, duration, error, now))
+    return cur.lastrowid
 
 
 def _record_switch_tx(cur, task_id: int | None, event_id: int, recipient: str,
@@ -899,14 +908,14 @@ def process_send_task(db: Database, task_id: int, senders: dict, settings: Setti
             snapshot_item = dict(item)
 
         # ---- 步骤 2：通道 IO（事务外，超时强杀） ----------------------------
-        result, error, duration = _call_sender(
+        result, error, duration, provider_message_id = _call_sender(
             task, snapshot_item, ch, senders, timeout)
 
         # ---- 步骤 3：落尝试结果 + 推进熔断 + 决定去留 -----------------------
         with db.tx() as cur:
             task = cur.execute("SELECT * FROM notif_send_tasks WHERE id=?",
                                (task_id,)).fetchone()
-            _record_attempt_tx(cur, task_id=task_id, channel=ch,
+            attempt_id = _record_attempt_tx(cur, task_id=task_id, channel=ch,
                                attempt_index=idx, round_no=task["round"],
                                probe=is_probe, result=result, duration=duration,
                                error=error, now=now)
@@ -916,13 +925,27 @@ def process_send_task(db: Database, task_id: int, senders: dict, settings: Setti
                                        task_id=task_id, now=now)
             if result == ATTEMPT_SUCCESS:
                 _mark_sent(cur, task, ch, now)
+                # email/webhook：登记外部服务返回的 message_id（送达确认锚点）。
+                # inbox 为站内兜底，不跟踪外部回执（receipt_status=not_required）。
+                external_pk = None
+                if ch in EXTERNAL_CHANNELS:
+                    external_pk = receipts.register_external_message_tx(
+                        cur, channel=ch, message_id=provider_message_id,
+                        id_source="provider" if provider_message_id else "local",
+                        source=receipts.SOURCE_ROUTE, send_task_id=task_id,
+                        attempt_id=attempt_id, recipient=task["recipient"],
+                        address=snapshot_item.get("address"),
+                        event_id=task["event_id"], event_type=task["event_type"],
+                        ts=now)
                 audit.record(cur, "notif_send_sent", None, None, {
                     "send_task_id": task_id, "todo_id": task["todo_id"],
                     "notify_event_id": task["event_id"],
                     "event_type": task["event_type"], "recipient": task["recipient"],
                     "channel": ch, "attempt": attempt_no,
                     "route_version": task["route_version"],
-                    "probe": is_probe, "duration": duration}, ts=now)
+                    "probe": is_probe, "duration": duration,
+                    "external_message_pk": external_pk,
+                    "message_id": provider_message_id}, ts=now)
                 return TASK_SENT
             cur.execute(
                 "UPDATE notif_send_tasks SET last_error=?, updated_at=? WHERE id=?",
@@ -1207,6 +1230,10 @@ def _task_view(db: Database, row: sqlite3.Row, *, with_history: bool = False) ->
         "sent_channel": row["sent_channel"], "sent_at": row["sent_at"],
         "next_retry_at": row["next_retry_at"], "round": row["round"],
         "last_error": row["last_error"], "cancelled_reason": row["cancelled_reason"],
+        "receipt_status": row["receipt_status"],
+        "receipt_reason": row["receipt_reason"],
+        "receipt_retries": row["receipt_retries"],
+        "external_message_id": row["external_message_id"],
         "created_at": row["created_at"], "updated_at": row["updated_at"]}
     if with_history:
         item["attempts"] = _attempts_view(db, row["id"])

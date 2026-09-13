@@ -64,6 +64,21 @@
                     最终成功或全部耗尽（原因逐条留痕）
 - notif_channel_state   通道健康与熔断状态（closed/open/half_open）、打开时间、恢复探针
                     归属与手工启用/停用；熔断期间不向该通道派发新请求
+- external_messages  外部通道消息登记：email/webhook 发送成功后登记外部服务返回的
+                    message_id（无真实返回时由本地生成 local:{...} 占位），是回执匹配
+                    与送达确认的锚点；source=route|legacy 分别对应版本化路由发送任务
+                    与旧链路 approval_notification_deliveries；同一任务可因重试/故障
+                    转移登记多条，被替代的行置 superseded，仅当前行接受终态
+- receipts           外部回执原文（只增不删、绝不改写）：message_id + 通道 + 事件 +
+                    内容哈希唯一（重复投递幂等）；能匹配消息的置 applied，不能匹配的进
+                    unmatched 待核对队列，人工绑定后转 bound（仍不改正文）；终态回执
+                    （delivered/bounced/complained/expired）不允许把已确认终态改回处理中
+- receipt_status_history  外部消息/回执状态变化历史：每次入位、确认、重试、转人工、
+                    绑定、重放只增一条，管理员可按通道/接收人/时间/状态查询完整轨迹
+- receipt_keys       外部回执验签密钥（按通道 email/webhook，可轮换、可带过渡期）：
+                    与回调入口的密钥环相互独立；active 行用于验签，旧行过渡期内可用
+- receipt_policy     送达确认策略（单例行 id=1）：确认超时秒数、失败/超时后自动沿
+                    通道计划重试的最大次数，超限或 action=manual 转人工
 """
 from __future__ import annotations
 
@@ -480,6 +495,8 @@ CREATE TABLE IF NOT EXISTS approval_notification_deliveries (
     group_id      INTEGER,                       -- 所属聚合组（approval_notification_groups.id；该表后建，故不声明外键）
     delayed_until REAL,
     ordinal       INTEGER NOT NULL DEFAULT 0,
+    receipt_status TEXT,                         -- 外部回执状态（旧链路登记 message_id 后跟踪）
+    external_message_id INTEGER REFERENCES external_messages(id),
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL
 );
@@ -701,6 +718,12 @@ CREATE TABLE IF NOT EXISTS notif_send_tasks (
     round         INTEGER NOT NULL DEFAULT 1,     -- 发送轮次：requeue 开新一轮，窗口连续失败按轮内统计
     quarantined_at REAL,
     cancelled_reason TEXT,
+    receipt_status TEXT NOT NULL DEFAULT 'not_required',
+        -- not_required（未登记外部消息，如 inbox）|pending|resending|delivered|
+        -- bounced|complained|expired|awaiting_confirmation|awaiting_manual|superseded
+    receipt_reason TEXT,                          -- 失败/转人工原因（回执 detail 或 no_receipt_timeout）
+    receipt_retries INTEGER NOT NULL DEFAULT 0,   -- 回执驱动的自动故障转移累计次数（跨消息登记行持久）
+    external_message_id INTEGER REFERENCES external_messages(id),  -- 当前外部消息登记行
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     UNIQUE (event_id, recipient)
@@ -744,6 +767,135 @@ CREATE TABLE IF NOT EXISTS notif_channel_switches (
 CREATE INDEX IF NOT EXISTS idx_notif_switches_task ON notif_channel_switches(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_notif_switches_channel
     ON notif_channel_switches(to_channel, id);
+
+-- 外部通道消息登记：email/webhook 每次发送成功后登记外部服务返回的 message_id。
+-- 它是回执匹配与送达确认的锚点：回执入口按 (channel, message_id) 找到本行。同一发送
+-- 任务因本通道重试或故障转移到新通道时会登记多行，旧行被同事务置 superseded（轨迹保留），
+-- 只有 status != 'superseded' 的行接受终态回执。
+CREATE TABLE IF NOT EXISTS external_messages (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel       TEXT NOT NULL,              -- email | webhook
+    message_id    TEXT NOT NULL,              -- 外部服务返回的消息编号；本地占位为 local:...
+    id_source     TEXT NOT NULL DEFAULT 'provider',  -- provider=外部返回；local=无返回时本地生成
+    source        TEXT NOT NULL,               -- route | legacy（路由发送任务 / 旧链路投递）
+    send_task_id  INTEGER REFERENCES notif_send_tasks(id),
+    delivery_id   INTEGER REFERENCES approval_notification_deliveries(id),
+    attempt_id    INTEGER REFERENCES notif_send_attempts(id),
+    recipient     TEXT NOT NULL,
+    address       TEXT,                        -- 实际发送地址（邮箱 / webhook URL）
+    event_id      INTEGER,                     -- 审批通知事件 id（便于按事件查询）
+    event_type    TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending',
+        -- pending|resending|delivered|bounced|complained|expired|
+        -- awaiting_confirmation|superseded（转人工 awaiting_manual 落在发送任务/投递行）
+    confirm_deadline REAL,                    -- 待确认截止（登记时刻 + 策略超时）；NULL=不跟踪
+    confirm_retries INTEGER NOT NULL DEFAULT 0,  -- 已自动故障转移/重试次数
+    active_receipt_id INTEGER REFERENCES receipts(id),  -- 驱动当前终态的回执（首条终态）
+    registered_at REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    UNIQUE (channel, message_id)               -- 同一通道同一外部消息编号只登记一次
+);
+CREATE INDEX IF NOT EXISTS idx_external_messages_task ON external_messages(send_task_id);
+CREATE INDEX IF NOT EXISTS idx_external_messages_delivery ON external_messages(delivery_id);
+CREATE INDEX IF NOT EXISTS idx_external_messages_match
+    ON external_messages(channel, message_id, status);
+CREATE INDEX IF NOT EXISTS idx_external_messages_scan
+    ON external_messages(status, confirm_deadline);
+CREATE INDEX IF NOT EXISTS idx_external_messages_recipient
+    ON external_messages(recipient, status);
+
+-- 外部回执原文：只增不删、绝不改写。同一 message_id 的重复回执由
+-- UNIQUE(channel,message_id,event,receipt_hash) 幂等（不同内容的迟到/乱序回执仍各自留盘）。
+-- matched=unmatched 时进入待核对队列；人工绑定到消息后 matched=bound（正文不变）。
+CREATE TABLE IF NOT EXISTS receipts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel       TEXT NOT NULL,              -- email | webhook
+    message_id    TEXT NOT NULL,
+    event         TEXT NOT NULL,              -- 规范化结果：delivered|bounced|complained|expired|unknown
+    recipient     TEXT,
+    receipt_hash  TEXT NOT NULL,              -- 原始报文 SHA-256（同内容重复投递判定）
+    raw_body      TEXT NOT NULL,              -- 原始报文（按 UTF-8 保留；人工核对/重放依据）
+    content_type  TEXT,
+    signature_kid TEXT,                       -- 验签所用密钥 kid
+    provider_ts   REAL,                       -- 回执自带的事件时间（若有）
+    matched       TEXT NOT NULL DEFAULT 'unmatched',  -- unmatched|applied|bound|ignored
+    message_pk    INTEGER REFERENCES external_messages(id),  -- 匹配/绑定到的消息登记行
+    send_task_id  INTEGER,                    -- 匹配时冗余（查询/审计用）
+    bound_by      TEXT,                       -- 人工绑定操作者
+    bound_at      REAL,
+    bind_note     TEXT,
+    terminal_rank INTEGER NOT NULL DEFAULT 0, -- delivered=1 / bounced,complained,expired=2 / unknown=0
+    duplicate_of  INTEGER REFERENCES receipts(id),  -- 重复投递指向首条回执
+    received_at   REAL NOT NULL,
+    created_at    REAL NOT NULL,
+    UNIQUE (channel, message_id, event, receipt_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_match ON receipts(matched, message_pk);
+CREATE INDEX IF NOT EXISTS idx_receipts_message ON receipts(channel, message_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_task ON receipts(send_task_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_recipient ON receipts(recipient);
+
+-- 状态变化历史：消息登记、回执确认、乱序/终态冲突、自动重试/转人工、人工绑定/忽略、
+-- 安全重放都只增一行。kind=message 记 external_messages 的状态转移；kind=receipt 记
+-- 回执的匹配/绑定处置。
+CREATE TABLE IF NOT EXISTS receipt_status_history (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL,               -- message | receipt
+    message_pk   INTEGER REFERENCES external_messages(id),
+    receipt_id   INTEGER REFERENCES receipts(id),
+    send_task_id INTEGER,
+    channel      TEXT NOT NULL,
+    recipient    TEXT,
+    from_status  TEXT,
+    to_status    TEXT NOT NULL,
+    reason       TEXT,
+    detail       TEXT NOT NULL DEFAULT '{}',
+    operator     TEXT,
+    created_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_history_message
+    ON receipt_status_history(message_pk, id);
+CREATE INDEX IF NOT EXISTS idx_receipt_history_receipt
+    ON receipt_status_history(receipt_id, id);
+CREATE INDEX IF NOT EXISTS idx_receipt_history_query
+    ON receipt_status_history(channel, recipient, to_status, id);
+
+-- 外部回执验签密钥（与回调入口密钥环相互独立）。每通道至多一行 active；轮换时旧行置
+-- retired 并给 grace_until（过渡期内仍可验签），超期一律拒绝。
+CREATE TABLE IF NOT EXISTS receipt_keys (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel     TEXT NOT NULL,                -- email | webhook
+    kid         TEXT NOT NULL,
+    secret      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active',  -- active | retired
+    grace_until REAL,                         -- retired 过渡期截止（epoch 秒）
+    created_by  TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    retired_at  REAL,
+    retired_by  TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_keys_active
+    ON receipt_keys(channel) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_receipt_keys_channel ON receipt_keys(channel, kid);
+
+-- 送达确认策略（单例行 id=1）：发送登记后 confirm_timeout_seconds 内没有终态回执则标记
+-- awaiting_confirmation；随后自动沿任务的通道计划故障转移（confirm_retries 计数），
+-- 达到 confirm_max_retries 或失败回执策略 action=manual 时转 awaiting_manual。
+CREATE TABLE IF NOT EXISTS receipt_policy (
+    id          INTEGER PRIMARY KEY CHECK (id=1),
+    confirm_timeout_seconds REAL NOT NULL,
+    confirm_max_retries INTEGER NOT NULL,
+    on_bounced  TEXT NOT NULL DEFAULT 'retry',  -- retry | manual
+    on_complained TEXT NOT NULL DEFAULT 'manual',
+    on_expired  TEXT NOT NULL DEFAULT 'retry',
+    updated_by  TEXT NOT NULL,
+    updated_at  REAL NOT NULL,
+    reason      TEXT
+);
+INSERT OR IGNORE INTO receipt_policy
+    (id, confirm_timeout_seconds, confirm_max_retries, on_bounced,
+     on_complained, on_expired, updated_by, updated_at, reason)
+VALUES (1, 3600, 2, 'retry', 'manual', 'retry', 'bootstrap', 0, 'default');
 """
 
 
@@ -930,6 +1082,37 @@ class Database:
                 # 存量待办的升级计时起点取创建时间
                 self._conn.execute(
                     "UPDATE approval_todos SET open_at=created_at WHERE open_at=0")
+        # 外部通道回执：路由发送任务与旧链路投递补「回执状态/原因/当前外部消息行」。
+        # 存量任务一律视为 not_required（升级不改变其行为；之后新发送才登记 message_id）。
+        if "notif_send_tasks" in tables:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(notif_send_tasks)")}
+            for name, ddl in (
+                ("receipt_status",
+                 "TEXT NOT NULL DEFAULT 'not_required'"),
+                ("receipt_reason", "TEXT"),
+                ("receipt_retries",
+                 "INTEGER NOT NULL DEFAULT 0"),
+                # 迁移期 external_messages 尚未建表，不加 REFERENCES（新库由 SCHEMA 建）
+                ("external_message_id", "INTEGER"),
+            ):
+                if name not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE notif_send_tasks ADD COLUMN {name} {ddl}")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_notif_send_receipt "
+                "ON notif_send_tasks(receipt_status)")
+        if "approval_notification_deliveries" in tables:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(approval_notification_deliveries)")}
+            for name, ddl in (
+                ("receipt_status", "TEXT"),
+                ("external_message_id", "INTEGER"),
+            ):
+                if name not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE approval_notification_deliveries "
+                        f"ADD COLUMN {name} {ddl}")
 
     @contextmanager
     def tx(self):

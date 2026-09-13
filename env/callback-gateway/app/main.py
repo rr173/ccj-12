@@ -29,6 +29,8 @@ from .notif_worker import NotificationWorker
 from .notif_policy import create_notif_policy_router
 from .notif_routing import configure_routing, create_routing_router
 from .notifications import create_notifications_router
+from . import receipts
+from .receipts import create_receipts_admin_router, create_receipts_public_router
 from .replay import ReplayWorker, create_replay_router
 from .replay_policy import create_policy_router
 from .replay_policy_gate import create_policy_gate_router
@@ -50,6 +52,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     notif_worker = NotificationWorker(db, settings)
     # 通知通道路由：在业务事务内入队时读取的默认熔断/超时配置
     configure_routing(settings)
+    # 外部回执：引导按通道验签密钥（环境变量）与确认策略缺省
+    receipts.bootstrap(db, settings)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -119,6 +123,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(create_notif_policy_router(db, settings))
     app.include_router(create_routing_router(
         db, settings, lambda: notif_worker.senders))
+    # 外部通道回执：公共验签接入口 + 管理员查询/绑定/重放/策略
+    app.include_router(create_receipts_public_router(db))
+    app.include_router(create_receipts_admin_router(db, settings))
     return app
 
 

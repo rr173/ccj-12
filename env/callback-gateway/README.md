@@ -41,6 +41,13 @@
                 │   首选超时或连续失败才切换下一通道；尝试/切换/结果全程留痕    │
                 │   时间窗口失败熔断：open 不派新请求，半开探针成功才恢复接流量 │
                 │   同事件×接收人跨通道只一条业务通知（重启/重扫/并发幂等）     │
+                ├────────────────────────────────────────────────────┤
+                │ 外部通道回执与送达确认  POST /receipts/{channel}        │
+                │   发送登记 message_id；按通道独立密钥验签的回执接入口   │
+                │   delivered/bounced/complained/expired：重复幂等、     │
+                │   乱序不回退终态；匹配不上的回执进待核对队列（可绑定）  │
+                │   超时扫描 -> 计划快照故障转移重试 -> 超限/策略转人工   │
+                │   原文/历史/队列多维查询；存证原文安全重放，无二次效果  │
                 └────────────────────────────────────────────────────┘
 ```
 
@@ -131,7 +138,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 208 个端到端测试
+python -m pytest tests/          # 端到端测试（回执模块 31 个，全套 239 个）
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -915,6 +922,93 @@ curl -X POST .../routing/channels/webhook/state -H 'Content-Type: application/js
 （计划、每次尝试与切换）。
 
 
+## 外部通道回执与送达确认
+
+在通知路由、发送任务与审计链路之上，系统为 email/webhook 外发提供**外部回执接入、
+送达确认与失败升级**（`app/receipts.py`）：
+
+- 发送成功后登记外部服务返回的 **message_id**（无真实返回时以 `local:...` 占位），
+  作为回执匹配锚点；同一发送任务重试/故障转移登记多条，旧行置 `superseded`。
+- 公共验签入口 `POST /receipts/{channel}`（密钥与回调入口密钥环**相互独立**、按通道
+  轮换），处理 `delivered` / `bounced` / `complained` / `expired` 等结果；回执原文
+  只增不删、**永不改写**。
+- **幂等**：同一 `(channel,message_id,event,正文哈希)` 的重复回执直接返回首条，
+  不二次驱动状态机；**乱序保护**：首条终态赢，迟到的另一终态只留
+  `receipt_terminal_ignored` 历史，不能把已确认终态改回处理中。
+- 匹配不上发送任务的回执进**待核对队列**；人工可绑定到任务（正文不变）或忽略，
+  也可以之后**安全重放**（用存证原文重跑幂等状态机，不产生第二次外部效果）。
+- 后台扫描：登记后超过 `RECEIPT_CONFIRM_TIMEOUT_SECONDS` 没有终态回执的消息标记
+  `awaiting_confirmation`，按当前任务的通道计划快照自动故障转移
+  （最多 `RECEIPT_CONFIRM_MAX_RETRIES` 次），超限或策略为 manual 时任务转
+  `awaiting_manual`，由人工在路由任务端点开新一轮或结案。
+
+```bash
+# 0) 接入口验签密钥：环境变量引导（RECEIPT_EMAIL_SECRET / RECEIPT_WEBHOOK_SECRET），
+#    之后在线轮换（旧钥默认 24h 过渡期，可立即吊销）；明文永不回显
+curl -X POST localhost:8000/admin/receipt-keys/email -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","kid":"rk2","secret":"new-channel-secret"}'
+curl localhost:8000/admin/receipt-keys
+# 立即吊销旧钥（grace_until 可在过去）
+curl -X POST localhost:8000/admin/receipt-keys/1/retire -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","grace_until":"2020-01-01T00:00:00Z"}'
+
+# 1) 确认/失败策略（超时秒数、自动重试次数、各失败事件 retry|manual）
+curl -X PUT localhost:8000/admin/receipt-policy -H 'Content-Type: application/json' -d '{
+  "operator":"ops-admin", "confirm_timeout_seconds":1800,
+  "confirm_max_retries":2, "on_bounced":"retry",
+  "on_complained":"manual", "on_expired":"retry"}'
+
+# 2) 外部通道投递回执（签名串与回调入口同构：HMAC_SHA256("{ts}\n"+body)）
+TS=$(date +%s)
+BODY='{"message_id":"provider-mid-1001","event":"delivered","ts":1789000000}'
+SIG=$(printf '%s\n%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$RECEIPT_EMAIL_SECRET" -hex | awk '{print $2}')
+curl -X POST localhost:8000/receipts/email -H 'Content-Type: application/json' \
+  -H "X-Signature: kid=email-bootstrap,ts=$TS,sig=$SIG" --data-raw "$BODY"
+# -> 200 {"result":"applied","disposition":"delivered", ...}
+# 重复投递 -> 200 {"result":"duplicate", ...}；匹配不上任务 -> 202 unmatched（待核对）
+
+# 3) 管理查询：回执原文（通道/接收人/时间/事件/匹配状态/消息侧状态）
+curl 'localhost:8000/admin/receipts?channel=email&event=delivered&time_from=…'
+curl localhost:8000/admin/receipts/12                 # 原文 + 处置历史
+curl localhost:8000/admin/external-messages?status=awaiting_manual
+curl localhost:8000/admin/external-messages/7        # 状态变化历史 + 全部回执
+curl 'localhost:8000/admin/receipt-history?recipient=ops-wang&status=bounced'
+curl localhost:8000/admin/receipt-review-queue       # 未匹配回执 + 待人工任务 + 待确认消息
+
+# 4) 人工：绑定未知回执（不改正文）/ 忽略 / 安全重放
+curl -X POST localhost:8000/admin/receipts/9/bind -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","task_id":12,"note":"与发送日志核对一致"}'
+curl -X POST localhost:8000/admin/receipts/9/ignore -d '{"operator":"ops-admin","reason":"测试流量"}'
+curl -X POST localhost:8000/admin/receipts/9/replay -d '{"operator":"ops-admin"}'
+
+# 5) 待人工发送任务：从失败通道的下一道开新一轮 / 结案
+curl -X POST localhost:8000/admin/approval-notifications/routing/tasks/12/receipt-resolve \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-admin","action":"retry"}'
+curl -X POST localhost:8000/admin/approval-notifications/routing/tasks/12/receipt-resolve \
+  -H 'Content-Type: application/json' -d '{"operator":"ops-admin","action":"ignore"}'
+```
+
+- **发送侧返回 message_id**：可注入的 sender（`NotificationWorker.senders["email"/
+  "webhook"]`）在成功时可 `return "外部编号"`；登记与发送成功在同一事务，崩溃不会出现
+  「已发送无锚点」。`inbox` 站内兜底不跟踪外部回执（`receipt_status=not_required`）。
+- **字段兼容**：回执 JSON 支持 `message_id/messageId/msg_id/id`、
+  `event/status/eventType`（`Delivery`/`hard_bounce`/`spam` 等别名归一）、
+  `recipient/email/address`、多种时间字段；无法识别的事件记为 `unknown`，只留盘不驱动。
+- **失败与超时的故障转移**：回执驱动的重试直接把任务按其**入队时通道计划快照**排到
+  下一通道（`notif_channel_switches.reason=receipt_failed/receipt_timeout`），外发仍由
+  既有单赢家领取与通道尝试链路执行；因此重启、重复投递、并发消费都不会产生第二次外部
+  效果。旧链路（未发布路由版本）的失败回执只更新回执状态并进入待核对/待人工视图，不
+  自动重发（它没有通道计划）。
+- **审计事件**：`receipt_signature_ok/fail`、`receipt_delivered`、`receipt_bounced`、
+  `receipt_complained`、`receipt_expired`、`receipt_unknown_recorded`、
+  `receipt_duplicate`、`receipt_unmatched`、`receipt_terminal_ignored`、
+  `receipt_confirmation_timeout`、`receipt_delivery_rescheduled`、
+  `receipt_confirmation_rescheduled`、`receipt_awaiting_manual`、
+  `receipt_manually_bound`、`receipt_ignored`、`receipt_replayed(s)`、
+  `receipt_policy_set`、`receipt_key_rotated/retired/seeded`、
+  `external_message_id_collision`，全部走只增的 `events` 表。
+
+
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -936,6 +1030,10 @@ curl -X POST .../routing/channels/webhook/state -H 'Content-Type: application/js
 | `NOTIF_BREAKER_FAILURE_THRESHOLD` | `5` | 窗口内连续失败多少次熔断（可在发布路由时按通道覆盖） |
 | `NOTIF_BREAKER_COOLDOWN_SECONDS` | `30` | 熔断 open 后多久允许一条 half_open 恢复探针 |
 | `NOTIF_CHANNEL_TIMEOUT_SECONDS` | `10` | 通道发送超时兜底（秒，可按通道 `timeout_seconds` 覆盖）；超时立即切换下一通道 |
+| `RECEIPT_CONFIRM_TIMEOUT_SECONDS` | `3600` | 外部回执确认超时：发送登记后多久没有终态回执算待确认（可用 `/admin/receipt-policy` 在线调整） |
+| `RECEIPT_CONFIRM_MAX_RETRIES` | `2` | 失败回执/确认超时后按任务通道计划自动故障转移的最大次数，超限转人工 |
+| `RECEIPT_EMAIL_SECRET` | _空_ | email 回执接入口引导验签密钥（未配置时须先在 `/admin/receipt-keys/email` 登记，验签 fail-closed） |
+| `RECEIPT_WEBHOOK_SECRET` | _空_ | webhook 回执接入口引导验签密钥（同上） |
 | `RUN_WORKER` | `true` | 是否在本进程跑后台 worker |
 
 ## 设计要点
@@ -996,3 +1094,7 @@ curl -X POST .../routing/channels/webhook/state -H 'Content-Type: application/js
   `notif_send_tasks`/`notif_send_attempts`/`notif_channel_switches`/
   `notif_channel_state` 表；当前路由版本指针初始为 NULL，因此发布路由版本之前所有通知
   仍走旧链路，存量行为完全不变，首次发布后新通知才改走版本化路由/熔断/故障转移。
+  外部回执功能再打开时新建 `external_messages`/`receipts`/
+  `receipt_status_history`/`receipt_keys`/`receipt_policy` 表，并给
+  `notif_send_tasks` 与 `approval_notification_deliveries` 补回执状态列（存量任务
+  为 `not_required`/NULL，行为与升级前完全一致；升级后新发送成功才登记 message_id）。

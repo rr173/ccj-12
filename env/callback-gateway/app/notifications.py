@@ -43,6 +43,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from . import audit
+from . import receipts
 from .config import Settings
 from .db import Database
 
@@ -1280,9 +1281,9 @@ def send_delivery(db: Database, delivery_id: int, senders, settings: Settings,
         if sender is None:
             raise RuntimeError(f"no sender configured for channel {row['channel']!r}")
         if row["channel"] == CHANNEL_EMAIL:
-            sender(row["address"], row["subject"], row["body"])
+            provider_message_id = sender(row["address"], row["subject"], row["body"])
         else:
-            sender(row["address"], json.loads(row["payload"] or "{}"))
+            provider_message_id = sender(row["address"], json.loads(row["payload"] or "{}"))
     except Exception as exc:  # noqa: BLE001 - 任何外发失败都走重试/隔离
         attempts = row["attempts"] + 1
         with db.tx() as cur:
@@ -1318,10 +1319,25 @@ def send_delivery(db: Database, delivery_id: int, senders, settings: Settings,
                    last_error=NULL, updated_at=? WHERE id=?
                AND status IN ('pending','failed')""",
             (now, now, delivery_id))
+        # 登记外部服务返回的 message_id（送达确认锚点；无真实返回时本地占位）
+        external_pk = receipts.register_external_message_tx(
+            cur, channel=row["channel"],
+            message_id=provider_message_id
+            if isinstance(provider_message_id, str) and provider_message_id.strip()
+            else None,
+            id_source="provider" if isinstance(provider_message_id, str)
+            and provider_message_id.strip() else "local",
+            source=receipts.SOURCE_LEGACY, delivery_id=delivery_id,
+            recipient=row["recipient"], address=row["address"],
+            event_id=None, event_type=None, ts=now)
+        cur.execute(
+            "UPDATE approval_notification_deliveries SET external_message_id=? "
+            "WHERE id=?", (external_pk, delivery_id))
         audit.record(cur, "approval_delivery_sent", None, None, {
             "delivery_id": delivery_id, "todo_id": row["todo_id"],
             "recipient": row["recipient"], "channel": row["channel"],
-            "attempts": row["attempts"] + 1}, ts=now)
+            "attempts": row["attempts"] + 1,
+            "external_message_pk": external_pk}, ts=now)
     return DELIVERY_SENT
 
 

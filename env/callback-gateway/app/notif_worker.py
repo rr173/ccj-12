@@ -24,6 +24,7 @@ import time
 from . import notif_policy
 from . import notifications as notif
 from . import notif_routing
+from . import receipts
 from .config import Settings
 from .db import Database
 
@@ -92,5 +93,10 @@ class NotificationWorker:
         # 5) 外发投递（旧链路）：到期重试、失败退避、超限隔离（按 ordinal 原事件顺序）
         notif.dispatch_due(self.db, self.senders, self.settings, now)
         # 6) 版本化路由链路：熔断闸门 + 有序故障转移 + 退避/隔离/恢复探针
+        notif_routing.dispatch_due_tasks(
+            self.db, self.senders, self.settings, now)
+        # 7) 送达确认：无回执的消息超时标待确认，按策略故障转移重试或转人工
+        receipts.scan_confirmations(self.db, now)
+        # 8) 回执驱动重排的任务立即在本轮补发（下一道通道）
         notif_routing.dispatch_due_tasks(
             self.db, self.senders, self.settings, now)
