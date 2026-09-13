@@ -1094,6 +1094,10 @@ def resolve_manual_task(db, task_id: int, req: ManualResolveRequest,
             cur.execute(
                 """UPDATE notif_send_tasks SET status='sent',
                    updated_at=? WHERE id=?""", (now, task_id))
+            # 确认不再发送：回收未使用的额度预占（已发送成功而 consumed 的不回收）
+            from . import notif_quota
+            notif_quota.release_for_task_tx(
+                cur, task, "receipt_manual_ignored", now)
             audit.record(cur, "receipt_manual_resolved", None, None, {
                 "send_task_id": task_id, "operator": operator,
                 "action": "ignore", "note": req.note,
@@ -1107,6 +1111,11 @@ def resolve_manual_task(db, task_id: int, req: ManualResolveRequest,
         start_idx, new_round = failed_idx + 1, int(task["round"])
         if start_idx >= len(plan):
             start_idx, new_round = 0, new_round + 1
+        # 人工发起的新发送轮次：额度代际 +1，按当时窗口重新预占（自动通道切换不经过
+        # 这里——它们复用既有预占，不能绕过同一事件的额度限制）。
+        from . import notif_quota
+        new_generation = notif_quota.bump_generation_tx(
+            cur, task, "receipt_manual_retry", now)
         cur.execute(
             """UPDATE notif_send_tasks SET status='pending', attempt_index=?,
                current_channel=NULL, round=?, next_retry_at=NULL,
@@ -1127,9 +1136,11 @@ def resolve_manual_task(db, task_id: int, req: ManualResolveRequest,
         audit.record(cur, "receipt_manual_resolved", None, None, {
             "send_task_id": task_id, "operator": operator, "action": "retry",
             "note": req.note, "receipt_status": prev_receipt,
-            "new_round": new_round, "attempt_index": start_idx}, ts=now)
+            "new_round": new_round, "attempt_index": start_idx,
+            "new_quota_generation": new_generation}, ts=now)
         return {"result": "retry_scheduled", "task_id": task_id,
-                "round": new_round, "attempt_index": start_idx}
+                "round": new_round, "attempt_index": start_idx,
+                "quota_generation": new_generation}
 
 
 def replay_receipt(db: Database, receipt_id: int, operator: str,

@@ -42,6 +42,12 @@
                 │   时间窗口失败熔断：open 不派新请求，半开探针成功才恢复接流量 │
                 │   同事件×接收人跨通道只一条业务通知（重启/重扫/并发幂等）     │
                 ├────────────────────────────────────────────────────┤
+                │ 接收人通知额度与抑制窗口  /admin/approval-notifications/quota/* │
+                │   按接收人×事件级别×时间窗口配置额度/单事件占用/超额处置   │
+                │   领取前原子预占：重试/重扫/回执通道切换不重复占用不绕过 │
+                │   超额延迟（窗口结束放行）/降级站内/转人工；入队快照固化 │
+                │   窗口到期释放；取消/忽略回收；重启恢复预占；稳定占用序 │
+                ├────────────────────────────────────────────────────┤
                 │ 外部通道回执与送达确认  POST /receipts/{channel}        │
                 │   发送登记 message_id；按通道独立密钥验签的回执接入口   │
                 │   delivered/bounced/complained/expired：重复幂等、     │
@@ -125,6 +131,11 @@
 | 重启/重复扫描/并发发送不越幂等 | 领取是条件 UPDATE（pending/failed→in_flight 单赢家）；启动 recover 把 in_flight 退回 pending；尝试与熔断统计只增落库，崩溃后从库内状态继续，不重发已成功通道 |
 | 查询路由版本/待发任务/通道健康/切换历史/审计 | `GET .../routing/current`·`/versions`、`/tasks`(+/tasks/{id} 含 attempts/switches)、`/channels/health`、`/switches`、`/attempts`；审计走 `events`（`notif_route_*`/`notif_send_*`/`notif_channel_*`） |
 | 发布新版本/回滚不影响已入队任务 | 发布整份生效（版本号单调递增，失败落 rejected 保留现版）；回滚到上一生效版本（原因必填）只推进 `notif_route_current` 指针，只影响之后入队的任务 |
+| 按接收人×事件级别×时间窗口配置通知额度与超额处置 | `notif_quota_versions` 版本化配置（规则按接收人/级别匹配，缺省规则兜底；事件级别内置映射可由 `event_levels` 覆盖；字段 window_seconds/limit/cost/on_exceeded=delay·downgrade·manual），任务入队时固化 `quota_version/quota_rule_id/quota_level/quota_snapshot`，发布/回滚不改变已入队任务，见 `app/notif_quota.py` |
+| 领取前原子预占，重复扫描/失败重试/回执通道切换不重复占用 | 领取（pending/failed→in_flight）同事务 `admit_or_defer_tx`：桶（版本×规则×接收人×固定窗口起点）内 reserved+consumed 的 normal 成本之和 + cost ≤ limit 才预占成功；同任务此后的退避重试、in_flight 恢复与回执驱动的通道切换只查既有预占直接放行（`quota_generation` 不变）；人工 requeue/重试才 generation+1 并回收旧预占重新占 |
+| 超额延迟/降级站内/转人工与稳定占用顺序 | delay：任务挂到窗口结束（`quota_status=delayed`，窗口到期落入新桶即释放额度）；downgrade：计划改为仅 inbox，记不计桶消耗的 downgraded 预占；manual：任务 awaiting_manual，`.../quota/tasks/{id}/resolve` retry/ignore；同接收人多事件按 (ordinal,id) 领取且低序号等待任务未预占时高序号不允许插队（notif_quota_order_wait） |
+| 取消/忽略/确认不再发送回收预占；重启可恢复 | `cancel_task_tx` 与人工 ignore 把未使用预占 reserved→released；发送成功转 consumed（窗口内不释放）；窗口到期旧桶行不再计入消耗；recover 把 in_flight 退回 pending 时保留其预占复用并对账回收孤儿预占 |
+| 查询额度版本/当前消耗/预占/被延迟降级人工任务/审计 | `GET .../quota/current`·`/versions`(+`/versions/{id}`)、`/usage`（规则×接收人×窗口 used/reserved/consumed/available/window_ends_at）、`/reservations`、`/tasks`（quota_status 过滤）、`POST /rollback`、`POST /tasks/{id}/resolve`；审计走 `events`（`notif_quota_*`） |
 | Docker 部署 | `Dockerfile` + `docker-compose.yml` |
 
 ## 快速开始

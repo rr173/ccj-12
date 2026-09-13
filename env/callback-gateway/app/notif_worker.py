@@ -11,6 +11,11 @@
 - flush_due_groups：到期聚合组合并为一条摘要投递（来源全部落定的组取消）；
 - pending/failed 的邮件/webhook 投递按指数退避发送，超过 NOTIF_MAX_ATTEMPTS 隔离。
 
+额度链路（app/notif_quota）：发送任务领取前在同一事务原子预占接收人×事件级别×
+时间窗口的额度；超额按入队快照延迟（任务挂 next_retry_at=窗口结束，步骤 6 自然
+延迟到窗口后）、降级 inbox 或转人工；取消/人工忽略回收预占，窗口到期旧桶不再计数
+（等同释放），重启恢复复用 in_flight 退回任务的预占——没有独立 worker 步骤。
+
 与主 worker、replay worker 同样的单连接写事务串行模型：所有状态转移都是条件更新，
 重复运行/重启不产生第二次效果。聚合 flush 与静默放行先于 dispatch，因此摘要/延迟通知
 在同一轮即可按序发出。通道调用（邮件/webhook IO）在事务外，可注入自定义 sender。

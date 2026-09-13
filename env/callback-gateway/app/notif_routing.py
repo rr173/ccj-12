@@ -68,6 +68,8 @@ TASK_SENT = "sent"
 TASK_FAILED = "failed"
 TASK_QUARANTINED = "quarantined"
 TASK_CANCELLED = "cancelled"
+# 回执失败转人工 / 额度超额转人工（receipts / notif_quota 设置）
+TASK_AWAITING_MANUAL = "awaiting_manual"
 
 BREAKER_CLOSED = "closed"
 BREAKER_OPEN = "open"
@@ -494,6 +496,11 @@ def enqueue_for_todo_tx(cur: sqlite3.Cursor, todo, event, settings: Settings,
         cur, config, event_type=event["event_type"],
         actionable=bool(event["actionable"]), source_type=todo["source_type"],
         risk_level=risk_level, recipient=todo["recipient"])
+    # 额度快照（按接收人 × 事件级别 × 时间窗口）：与路由版本相互独立，入队时命中即固化，
+    # 之后额度配置的发布/回滚不改变本任务的占用规则。
+    from . import notif_quota
+    qsnap = notif_quota.snapshot_for_enqueue(
+        cur, recipient=todo["recipient"], event_type=event["event_type"])
     # 先落任务（拿到 task_id），再逐条解析地址，使「无地址跳过」的切换记录也能关联到
     # 本任务（完整切换轨迹）。计划为 [] 时任务在同一事务内取消并留 skipped 审计。
     cur.execute(
@@ -501,8 +508,11 @@ def enqueue_for_todo_tx(cur: sqlite3.Cursor, todo, event, settings: Settings,
            (todo_id, event_id, recipient, event_type, source_type, batch_id,
             change_id, node_id, subject, body, ordinal, status, route_version,
             route_snapshot, plan_json, attempt_index, total_attempts,
-            current_channel, round, next_retry_at, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, '[]', 0, 0, NULL, 1, NULL, ?, ?)""",
+            current_channel, round, next_retry_at,
+            quota_version, quota_rule_id, quota_level, quota_snapshot,
+            created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?, '[]', 0, 0, NULL, 1, NULL,
+                   ?,?,?,?, ?, ?)""",
         (todo["id"], event["id"], todo["recipient"], event["event_type"],
          todo["source_type"], todo["batch_id"], todo["change_id"], todo["node_id"],
          event["subject"], event["body"], todo["id"], version,
@@ -512,6 +522,11 @@ def enqueue_for_todo_tx(cur: sqlite3.Cursor, todo, event, settings: Settings,
                                "max_attempts": s["max_attempts"],
                                "condition": s.get("condition")} for s in specs]},
                     ensure_ascii=False, sort_keys=True),
+         qsnap["quota_version"] if qsnap else None,
+         qsnap["rule_id"] if qsnap else None,
+         qsnap["level"] if qsnap else None,
+         json.dumps(qsnap["snapshot"], ensure_ascii=False, sort_keys=True)
+         if qsnap else None,
          now, now))
     task_id = cur.lastrowid
     # 解析每通道地址；外发通道无可用地址则跳过（记切换原因 no_address，不占尝试次数）
@@ -601,6 +616,9 @@ def cancel_task_tx(cur: sqlite3.Cursor, task_id: int, reason: str,
         """UPDATE notif_channel_state SET state='open', probe_task_id=NULL,
            probe_at=NULL, updated_at=? WHERE probe_task_id=?""",
         (now, task_id))
+    # 回收该任务未使用的额度预占（已发送 consumed 的不回收；取消即确认不会再发送）
+    from . import notif_quota
+    notif_quota.release_for_task_tx(cur, row, reason, now)
     audit.record(cur, "notif_send_task_cancelled", None, None, {
         "send_task_id": task_id, "todo_id": row["todo_id"],
         "event_type": row["event_type"], "recipient": row["recipient"],
@@ -868,6 +886,14 @@ def process_send_task(db: Database, task_id: int, senders: dict, settings: Setti
         if todo is None or todo["status"] not in notif.OPEN_TODO_STATUSES:
             cancel_task_tx(cur, task_id, "todo_closed", now)
             return TASK_CANCELLED
+        # 额度闸门：领取前在同一事务原子预占。重复扫描/失败重试复用同代预占不重复占用；
+        # 超额按入队时快照延迟（回 pending）/降级 inbox（改计划）/转人工。
+        from . import notif_quota
+        gate = notif_quota.admit_or_defer_tx(cur, task, now)
+        if gate["decision"] == "delay":
+            return TASK_PENDING
+        if gate["decision"] == "manual":
+            return TASK_AWAITING_MANUAL
 
     # 单轮内沿计划逐通道推进。每一步独立短事务：先过派发闸门（熔断/停用/探针占用），
     # 再在事务外做通道 IO，最后在新事务里落尝试结果、推进熔断与计划下标。
@@ -925,6 +951,10 @@ def process_send_task(db: Database, task_id: int, senders: dict, settings: Setti
                                        task_id=task_id, now=now)
             if result == ATTEMPT_SUCCESS:
                 _mark_sent(cur, task, ch, now)
+                # 预占转 consumed（含降级预占）：本事件的额度在窗口内真正用掉，
+                # 后续重试/回执通道切换复用同一预占、不再重复占用。
+                from . import notif_quota
+                notif_quota.mark_consumed_tx(cur, task, now)
                 # email/webhook：登记外部服务返回的 message_id（送达确认锚点）。
                 # inbox 为站内兜底，不跟踪外部回执（receipt_status=not_required）。
                 external_pk = None
@@ -1133,6 +1163,11 @@ def recover_in_flight_tasks(db: Database, now: float | None = None) -> int:
             audit.record(cur, "notif_send_task_recovered", None, None,
                          {"send_task_id": r["id"],
                           "channel": r["current_channel"]}, ts=now)
+    # 额度对账：退回 pending 的任务保留其预占（下轮领取复用）；防御性回收已终结任务的
+    # 孤儿预占。in_flight 退回 pending 本身不重复占用（预占行按 generation 复用）。
+    from . import notif_quota
+    with db.tx() as cur:
+        notif_quota.reconcile_on_recover_tx(cur, now)
     return len(rows)
 
 
@@ -1148,6 +1183,9 @@ def requeue_task(db: Database, task_id: int, operator: str,
             raise HTTPException(404, "notification send task not found")
         if row["status"] != TASK_QUARANTINED:
             raise HTTPException(409, f"send task is {row['status']}, not quarantined")
+        from . import notif_quota
+        new_gen = notif_quota.bump_generation_tx(
+            cur, row, "manual_requeue", now)
         cur.execute(
             """UPDATE notif_send_tasks SET status='pending', attempt_index=0,
                round=round+1, next_retry_at=NULL, last_error=NULL,
@@ -1156,8 +1194,10 @@ def requeue_task(db: Database, task_id: int, operator: str,
         audit.record(cur, "notif_send_task_requeued", None, None, {
             "send_task_id": task_id, "operator": operator,
             "recipient": row["recipient"], "event_type": row["event_type"],
-            "new_round": row["round"] + 1}, ts=now)
-    return {"result": "requeued", "task_id": task_id, "round": row["round"] + 1}
+            "new_round": row["round"] + 1,
+            "new_quota_generation": new_gen}, ts=now)
+    return {"result": "requeued", "task_id": task_id, "round": row["round"] + 1,
+            "quota_generation": new_gen}
 
 
 # ============================================================================
@@ -1234,11 +1274,20 @@ def _task_view(db: Database, row: sqlite3.Row, *, with_history: bool = False) ->
         "receipt_reason": row["receipt_reason"],
         "receipt_retries": row["receipt_retries"],
         "external_message_id": row["external_message_id"],
+        "quota_version": row["quota_version"],
+        "quota_rule_id": row["quota_rule_id"],
+        "quota_level": row["quota_level"],
+        "quota_status": row["quota_status"],
+        "quota_reason": row["quota_reason"],
+        "quota_generation": row["quota_generation"],
+        "quota_snapshot": None,
         "created_at": row["created_at"], "updated_at": row["updated_at"]}
     if with_history:
         item["attempts"] = _attempts_view(db, row["id"])
         item["switches"] = _switches_view(db, row["id"])
         item["route_snapshot"] = json.loads(row["route_snapshot"])
+        if row["quota_snapshot"]:
+            item["quota_snapshot"] = json.loads(row["quota_snapshot"])
     return item
 
 

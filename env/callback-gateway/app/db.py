@@ -79,6 +79,15 @@
                     与回调入口的密钥环相互独立；active 行用于验签，旧行过渡期内可用
 - receipt_policy     送达确认策略（单例行 id=1）：确认超时秒数、失败/超时后自动沿
                     通道计划重试的最大次数，超限或 action=manual 转人工
+- notif_quota_versions / notif_quota_current  接收人通知额度与抑制窗口的版本化配置：
+                    运营按接收人（NULL=全体）、事件级别（info|normal|critical）配置
+                    时间窗口、额度、单事件占用与超额处理（delay|downgrade|manual）；
+                    发送任务固化入队时的额度规则快照，配置更新/回滚不影响已入队任务
+- notif_quota_reservations  发送任务领取前的原子预占（同一「规则版本×规则×接收人×
+                    窗口」滚动/固定窗口内的占用汇总即当前消耗）；同一事件重试、回执
+                    驱动的通道切换只复用本任务的预占（generation 不变不重复占用），
+                    取消/人工忽略/确认不再发送时回收（reserved->released），发送成功
+                    转 consumed；窗口到期后旧窗口行不再计入消耗（等同释放可用额度）
 """
 from __future__ import annotations
 
@@ -724,6 +733,17 @@ CREATE TABLE IF NOT EXISTS notif_send_tasks (
     receipt_reason TEXT,                          -- 失败/转人工原因（回执 detail 或 no_receipt_timeout）
     receipt_retries INTEGER NOT NULL DEFAULT 0,   -- 回执驱动的自动故障转移累计次数（跨消息登记行持久）
     external_message_id INTEGER REFERENCES external_messages(id),  -- 当前外部消息登记行
+    -- 接收人通知额度与抑制窗口：入队时命中的规则快照（NULL=未发布额度配置或无规则命中，
+    -- 领取时不受额度闸门约束）；quota_status 记录该任务在额度链路的最近一次处置。
+    quota_version INTEGER,                    -- 入队时命中的额度配置版本
+    quota_rule_id TEXT,                       -- 命中规则标识（'*'=缺省规则；NULL=无规则）
+    quota_level TEXT,                         -- 解析出的事件级别 info|normal|critical
+    quota_snapshot TEXT,                      -- 入队时规则快照 JSON（window/limit/cost/on_exceeded）
+    quota_status TEXT NOT NULL DEFAULT 'none',
+        -- none|admitted|delayed|downgraded|manual|ignored|consumed|released
+    quota_reason TEXT,                        -- 超额处置/延迟/回收原因
+    quota_generation INTEGER NOT NULL DEFAULT 1,  -- 预占代：人工 requeue/重试 +1（重新预占），
+                                                  -- 失败重试/回执驱动通道切换不变（复用预占）
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     UNIQUE (event_id, recipient)
@@ -732,6 +752,10 @@ CREATE INDEX IF NOT EXISTS idx_notif_send_pick
     ON notif_send_tasks(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_notif_send_todo ON notif_send_tasks(todo_id);
 CREATE INDEX IF NOT EXISTS idx_notif_send_recipient ON notif_send_tasks(recipient, status);
+CREATE INDEX IF NOT EXISTS idx_notif_send_quota
+    ON notif_send_tasks(quota_version, quota_rule_id, recipient);
+CREATE INDEX IF NOT EXISTS idx_notif_send_quota_status
+    ON notif_send_tasks(quota_status);
 
 -- 每次通道尝试一行（含恢复探针）：result=success|failure|timeout，duration 秒。
 -- 熔断窗口统计「该通道最近 window_seconds 内、自上次成功以来的连续失败数」即查本表。
@@ -896,6 +920,67 @@ INSERT OR IGNORE INTO receipt_policy
     (id, confirm_timeout_seconds, confirm_max_retries, on_bounced,
      on_complained, on_expired, updated_by, updated_at, reason)
 VALUES (1, 3600, 2, 'retry', 'manual', 'retry', 'bootstrap', 0, 'default');
+
+-- 接收人通知额度与抑制窗口的版本化配置：每次发布（含被拒绝的提交）一条。
+-- applied=整份配置生效后的版本号（单调递增）；rollback 行记录一次回滚动作
+-- （version=回滚目标版本）；rejected 为校验失败的提交（config_json 保留原始内容）。
+CREATE TABLE IF NOT EXISTS notif_quota_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version     INTEGER,               -- applied/rollback 时的目标版本号；rejected 为 NULL
+    result      TEXT NOT NULL,         -- applied|rejected|rollback
+    config_json TEXT,                  -- applied/rollback：规范化配置；rejected：原始提交
+    operator    TEXT NOT NULL,
+    reason      TEXT,                  -- rejected/rollback 的原因
+    created_at  REAL NOT NULL
+);
+
+-- 当前生效额度配置指针（单行 id=1）。发布/回滚只推进这一行；发送任务固化入队时命中的
+-- 规则快照（notif_send_tasks.quota_snapshot），配置更新不改变已入队任务的占用规则。
+CREATE TABLE IF NOT EXISTS notif_quota_current (
+    id           INTEGER PRIMARY KEY CHECK (id=1),
+    quota_version INTEGER,            -- 当前生效版本；NULL=尚未配置（额度闸门不生效）
+    updated_by   TEXT NOT NULL,
+    updated_at   REAL NOT NULL,
+    reason       TEXT
+);
+INSERT OR IGNORE INTO notif_quota_current (id, quota_version, updated_by, updated_at)
+VALUES (1, NULL, 'bootstrap', 0);
+
+-- 额度预占：发送任务领取（pending/failed -> in_flight）前在同一写事务内原子预占。
+-- 桶（bucket）= 规则版本 + 规则标识 + 接收人 + 窗口起点；桶内 state='reserved' 的
+-- normal 预占 cost 之和即当前占用，达到 limit 即超额。downgraded 预占不计入桶消耗
+-- （降级为站内通知不占外发额度），但留行可查。窗口到期后旧桶行不再被任何查询计入，
+-- 等同释放可用额度（无需后台清理）。
+-- generation=notif_send_tasks.quota_generation：同一事件的失败重试、回执驱动的通道
+-- 切换 generation 不变，复用本预占，绝不重复占用；人工 requeue/重试开新一轮时
+-- generation+1 并回收旧预占。
+CREATE TABLE IF NOT EXISTS notif_quota_reservations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL REFERENCES notif_send_tasks(id),
+    event_id    INTEGER NOT NULL,
+    recipient   TEXT NOT NULL,
+    quota_version INTEGER NOT NULL,    -- 命中规则所属配置版本
+    rule_id     TEXT NOT NULL,         -- 规则标识（规则配置内唯一；NULL 规则用 '*'）
+    level       TEXT NOT NULL,         -- info|normal|critical（命中时的事件级别）
+    bucket_start REAL NOT NULL,        -- 窗口起点（epoch 秒）
+    window_seconds REAL NOT NULL,
+    cost        INTEGER NOT NULL,      -- 本事件占用额度（正整数）
+    kind        TEXT NOT NULL DEFAULT 'normal',  -- normal|downgraded
+    state       TEXT NOT NULL DEFAULT 'reserved', -- reserved|consumed|released
+    generation  INTEGER NOT NULL DEFAULT 1,       -- = 发送任务的 quota_generation
+    reason      TEXT,                  -- downgraded/released 的原因（超额动作/取消原因等）
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+-- 同一任务同一代至多一条活跃预占（重复扫描/重试/重启恢复不重复占用）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_reserv_active
+    ON notif_quota_reservations(task_id, generation) WHERE state='reserved';
+CREATE INDEX IF NOT EXISTS idx_quota_reserv_bucket
+    ON notif_quota_reservations(quota_version, rule_id, recipient,
+                                bucket_start, state);
+CREATE INDEX IF NOT EXISTS idx_quota_reserv_task ON notif_quota_reservations(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_quota_reserv_window
+    ON notif_quota_reservations(recipient, bucket_start);
 """
 
 
@@ -1113,6 +1198,27 @@ class Database:
                     self._conn.execute(
                         f"ALTER TABLE approval_notification_deliveries "
                         f"ADD COLUMN {name} {ddl}")
+        # 接收人通知额度与抑制窗口：老库发送任务补额度快照/预占代列（存量任务视为
+        # 发布额度配置前入队，quota_rule_id=NULL 永不被额度闸门拦截）。
+        if "notif_send_tasks" in tables:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(notif_send_tasks)")}
+            for name, ddl in (
+                ("quota_version", "INTEGER"),
+                ("quota_rule_id", "TEXT"),
+                ("quota_level", "TEXT"),
+                ("quota_snapshot", "TEXT"),
+                ("quota_status", "TEXT NOT NULL DEFAULT 'none'"),
+                ("quota_reason", "TEXT"),
+                ("quota_generation",
+                 "INTEGER NOT NULL DEFAULT 1"),
+            ):
+                if name not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE notif_send_tasks ADD COLUMN {name} {ddl}")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_notif_send_quota "
+                "ON notif_send_tasks(quota_version, quota_rule_id, recipient)")
 
     @contextmanager
     def tx(self):
