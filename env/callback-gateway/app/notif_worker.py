@@ -81,9 +81,10 @@ class NotificationWorker:
     def recover(self) -> int:
         """启动恢复：崩溃时卡在 in_flight 的路由发送任务退回 pending（尝试历史、
         熔断窗口与通道快照都在库里，重启后不会对已成功通道重发）；对账扫描中任务
-        退回队列并从游标继续。"""
+        退回队列并从游标继续。返回本次恢复的发送任务与对账任务总数。"""
         recovered = notif_routing.recover_in_flight_tasks(self.db, self.clock())
-        notif_reconciliation.recover_reconciliation_jobs(self.db, self.clock())
+        recovered += notif_reconciliation.recover_reconciliation_jobs(
+            self.db, self.clock())
         return recovered
 
     def run_once(self):

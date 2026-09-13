@@ -775,16 +775,33 @@ def process_due_jobs(db: Database, now: float | None = None,
 
 
 def recover_reconciliation_jobs(db: Database, now: float | None = None) -> int:
-    """服务重启：扫描中任务安全退回 queued；已固化游标和快照保证续跑不重复。"""
+    """服务重启：扫描中任务安全退回 queued；已固化游标和快照保证续跑不重复。
+
+    每个被恢复的任务单独落一条带 job_id 的审计事件，使按任务查询事件可见恢复轨迹。
+    """
     now = time.time() if now is None else now
     with db.tx() as cur:
-        n = cur.execute(
-            """UPDATE notif_reconciliation_jobs SET status='queued',
-               next_retry_at=NULL, updated_at=?
-               WHERE status='scanning'""", (now,)).rowcount
-        if n:
-            audit.record(cur, "notif_reconciliation_recovered", None, None,
-                         {"recovered": n}, ts=now)
+        rows = cur.execute(
+            """SELECT id,phase,cursor_task_id,cursor_message_id,cursor_receipt_id,
+                      cursor_reservation_id,attempts
+               FROM notif_reconciliation_jobs WHERE status='scanning'""").fetchall()
+        n = 0
+        for r in rows:
+            cur.execute(
+                """UPDATE notif_reconciliation_jobs SET status='queued',
+                   next_retry_at=NULL, updated_at=? WHERE id=? AND status='scanning'""",
+                (now, r["id"]))
+            if cur.rowcount:
+                n += 1
+                audit.record(cur, "notif_reconciliation_recovered", None, None, {
+                    "job_id": r["id"], "recovered": 1,
+                    "phase": r["phase"],
+                    "cursor": {
+                        "task_id": r["cursor_task_id"],
+                        "message_id": r["cursor_message_id"],
+                        "receipt_id": r["cursor_receipt_id"],
+                        "reservation_id": r["cursor_reservation_id"]},
+                    "attempts": r["attempts"]}, ts=now)
     return n
 
 

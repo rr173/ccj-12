@@ -129,7 +129,15 @@ def test_reconciliation_snapshot_pagination_pause_resume_and_restart(tmp_path):
                         ) if False else None
             cur.execute("UPDATE notif_reconciliation_jobs SET status='scanning' "
                         "WHERE id=?", (job_id,))
-        c.app.state.notif_worker.recover()
+        recovered = c.app.state.notif_worker.recover()
+        # 恢复流程必须返回实际恢复的任务数（1 个 scanning 对账任务）
+        assert recovered == 1
+        # 按任务查询事件必须能看到恢复审计记录
+        job_events = c.get(f"{RECON}/jobs/{job_id}/events").json()["events"]
+        rec_events = [e for e in job_events
+                      if e["type"] == "notif_reconciliation_recovered"]
+        assert len(rec_events) == 1
+        assert rec_events[0]["detail"]["job_id"] == job_id
         c.app.state.notif_worker.run_once()
         again = findings(c, job_id)
         assert len(again) == len(rows)
