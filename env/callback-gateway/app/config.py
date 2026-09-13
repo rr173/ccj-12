@@ -30,6 +30,12 @@ class Settings:
     notif_max_attempts: int = 5
     # 审批截止前多少秒生成 deadline_approaching 提醒事件（每节点/变更单至多一次）
     notif_deadline_lead_seconds: float = 300.0
+    # 通知通道路由/熔断：失败统计窗口、窗口内连续失败熔断阈值、熔断冷却（半开探针）秒数、
+    # 发送超时兜底秒数（通道级 timeout_seconds 缺省值；发件调用另被工作线程强杀超时）
+    notif_breaker_window_seconds: float = 60.0
+    notif_breaker_failure_threshold: int = 5
+    notif_breaker_cooldown_seconds: float = 30.0
+    notif_channel_timeout_seconds: float = 10.0
     # 是否随服务启动后台 worker（测试时可关闭，手动驱动）
     run_worker: bool = True
 
@@ -57,5 +63,14 @@ class Settings:
                 "NOTIF_MAX_ATTEMPTS", cls.notif_max_attempts)),
             notif_deadline_lead_seconds=float(os.environ.get(
                 "NOTIF_DEADLINE_LEAD_SECONDS", cls.notif_deadline_lead_seconds)),
+            notif_breaker_window_seconds=float(os.environ.get(
+                "NOTIF_BREAKER_WINDOW_SECONDS", cls.notif_breaker_window_seconds)),
+            notif_breaker_failure_threshold=int(os.environ.get(
+                "NOTIF_BREAKER_FAILURE_THRESHOLD",
+                cls.notif_breaker_failure_threshold)),
+            notif_breaker_cooldown_seconds=float(os.environ.get(
+                "NOTIF_BREAKER_COOLDOWN_SECONDS", cls.notif_breaker_cooldown_seconds)),
+            notif_channel_timeout_seconds=float(os.environ.get(
+                "NOTIF_CHANNEL_TIMEOUT_SECONDS", cls.notif_channel_timeout_seconds)),
             run_worker=os.environ.get("RUN_WORKER", "true").lower() == "true",
         )

@@ -785,6 +785,11 @@ def stop_escalations_for_todo_tx(cur: sqlite3.Cursor, base_todo_id: int, *,
                     WHERE todo_id IN ({qmarks})
                       AND status IN ('pending','failed','held','delayed')""",
                 (now, *todo_ids)).rowcount
+            # 同一批升级待办若走版本化路由链路，其未发出发送任务一并取消
+            from . import notif_routing
+            for tid in todo_ids:
+                notif_routing.cancel_tasks_for_todo_tx(
+                    cur, tid, f"escalation_{reason}", now)
         cur.execute(
             "UPDATE approval_escalations SET status='stopped', stop_reason=?, "
             "stopped_at=?, updated_at=? WHERE id=? AND status<>'stopped'",

@@ -23,6 +23,7 @@ import time
 
 from . import notif_policy
 from . import notifications as notif
+from . import notif_routing
 from .config import Settings
 from .db import Database
 
@@ -39,13 +40,19 @@ def _noop_webhook(address: str, payload: dict) -> None:
     log.info("webhook url=%s event=%s", address, payload.get("event"))
 
 
+def _noop_inbox(task) -> None:
+    """站内通道：待办已即时落盘，路由计划走到 inbox 仅作成功兜底（不产生第二个通知）。"""
+    log.info("inbox todo=%s recipient=%s", task["todo_id"], task["recipient"])
+
+
 class NotificationWorker:
     def __init__(self, db: Database, settings: Settings, senders: dict | None = None,
                  clock=time.time):
         self.db = db
         self.settings = settings
         self.senders = senders or {notif.CHANNEL_EMAIL: _noop_email,
-                                   notif.CHANNEL_WEBHOOK: _noop_webhook}
+                                   notif.CHANNEL_WEBHOOK: _noop_webhook,
+                                   notif_routing.CHANNEL_INBOX: _noop_inbox}
         self.clock = clock
         self._stop = asyncio.Event()
 
@@ -64,6 +71,11 @@ class NotificationWorker:
     def stop(self):
         self._stop.set()
 
+    def recover(self) -> int:
+        """启动恢复：崩溃时卡在 in_flight 的路由发送任务退回 pending（尝试历史、
+        熔断窗口与通道快照都在库里，重启后不会对已成功通道重发）。"""
+        return notif_routing.recover_in_flight_tasks(self.db, self.clock())
+
     def run_once(self):
         now = self.clock()
         # 0) 静默时段结束：delayed 按原事件顺序放回发送队列（先于一切生成/发送）
@@ -77,5 +89,8 @@ class NotificationWorker:
         notif_policy.scan_escalations(self.db, now)
         # 4) 聚合窗口：到期组合并为一条摘要（全部落定的组取消）
         notif_policy.flush_due_groups(self.db, now)
-        # 5) 外发投递：到期重试、失败退避、超限隔离（按 ordinal 原事件顺序）
+        # 5) 外发投递（旧链路）：到期重试、失败退避、超限隔离（按 ordinal 原事件顺序）
         notif.dispatch_due(self.db, self.senders, self.settings, now)
+        # 6) 版本化路由链路：熔断闸门 + 有序故障转移 + 退避/隔离/恢复探针
+        notif_routing.dispatch_due_tasks(
+            self.db, self.senders, self.settings, now)

@@ -52,6 +52,18 @@
                     升级接收人与触发时限（待办生成后 N 秒或截止前 N 秒）；每级触发与
                     升级级别落盘可查；原接收人处理（或来源落定）后升级立即停止，
                     未发出的升级通知同事务取消
+- notif_route_versions / notif_route_current  通知通道路由配置的版本化快照：运营按事件
+                    类型配置 email/webhook/inbox 的优先级、启用状态与接收条件；发送任务按
+                    入队时的版本快照选择通道；新版本发布/回滚只影响之后入队的任务
+- notif_send_tasks  路由发送任务：同一事件对同一接收人至多一条（UNIQUE(event_id,recipient)，
+                    跨通道不重复产生业务通知）；固化路由版本与有序通道计划快照，记录当前
+                    通道位置、尝试次数与最终结果（sent/quarantined/cancelled）
+- notif_send_attempts  每个任务在每个通道上的每次尝试（成功/失败/超时，耗时与错误），
+                    同时作为通道熔断「时间窗口内连续失败」的统计来源
+- notif_channel_switches  通道切换历史：选中首选、超时/连续失败/熔断/通道停用切换、
+                    最终成功或全部耗尽（原因逐条留痕）
+- notif_channel_state   通道健康与熔断状态（closed/open/half_open）、打开时间、恢复探针
+                    归属与手工启用/停用；熔断期间不向该通道派发新请求
 """
 from __future__ import annotations
 
@@ -615,6 +627,123 @@ CREATE TABLE IF NOT EXISTS approval_escalation_levels (
 );
 CREATE INDEX IF NOT EXISTS idx_escalation_levels_esc
     ON approval_escalation_levels(escalation_id);
+
+-- 通知通道路由配置版本：每次发布（含被拒绝的提交）一条。applied=配置整份生效后的
+-- 版本号（单调递增）；rollback 行记录一次回滚动作（version=回滚目标版本）；rejected
+-- 为校验失败的提交（config_json 保留原始内容，reason 记录失败原因）。
+CREATE TABLE IF NOT EXISTS notif_route_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version     INTEGER,               -- applied/rollback 时的目标版本号；rejected 为 NULL
+    result      TEXT NOT NULL,         -- applied|rejected|rollback
+    config_json TEXT,                  -- applied/rollback：规范化配置；rejected：原始提交
+    operator    TEXT NOT NULL,
+    reason      TEXT,                  -- rejected/rollback 的原因
+    created_at  REAL NOT NULL
+);
+
+-- 当前生效路由版本指针（单行 id=1）。发布/回滚只推进这一行，发送任务入队时在此读版本
+-- 并固化快照；指针推进不影响已入队任务（它们持有自己的 route_snapshot）。
+CREATE TABLE IF NOT EXISTS notif_route_current (
+    id          INTEGER PRIMARY KEY CHECK (id=1),
+    route_version INTEGER,             -- 当前生效版本；NULL=尚未配置（走旧链路）
+    updated_by  TEXT NOT NULL,
+    updated_at  REAL NOT NULL,
+    reason      TEXT
+);
+INSERT OR IGNORE INTO notif_route_current (id, route_version, updated_by, updated_at)
+VALUES (1, NULL, 'bootstrap', 0);
+
+-- 通道健康/熔断状态（每通道一行：email/webhook/inbox）。熔断窗口内连续失败达到阈值则
+-- open（不派发新请求），冷却 cooldown 秒后转 half_open 放一条恢复探针，探针成功才 closed
+-- 重新接流量；探针失败回到 open。窗口统计来自 notif_send_attempts（成功即重新计数）。
+CREATE TABLE IF NOT EXISTS notif_channel_state (
+    channel       TEXT PRIMARY KEY,    -- email|webhook|inbox
+    state         TEXT NOT NULL DEFAULT 'closed',  -- closed|open|half_open
+    enabled       INTEGER NOT NULL DEFAULT 1,      -- 运营手工停用：派发与探针一律不选
+    failure_threshold INTEGER NOT NULL,            -- 窗口内连续失败多少次熔断
+    window_seconds REAL NOT NULL,                  -- 失败统计时间窗口
+    cooldown_seconds REAL NOT NULL,                -- open 后多久允许一条恢复探针
+    opened_at     REAL,
+    last_failure_at REAL,
+    probe_task_id INTEGER,                          -- half_open 时占用探针的任务
+    probe_at      REAL,
+    updated_at    REAL NOT NULL
+);
+
+-- 路由发送任务：一个审批通知事件对一个接收人至多一条（UNIQUE(event_id,recipient)
+-- 兜底重启/重复扫描/并发），它替代「每通道一条 approval_notification_deliveries 行」——
+-- 任务按入队时版本快照里的有序通道计划逐个尝试，成功一条即终态 sent，绝不跨通道重复
+-- 通知；全计划耗尽（无 inbox 兜底）才 quarantined，可人工 requeue 重开一轮。
+CREATE TABLE IF NOT EXISTS notif_send_tasks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    todo_id       INTEGER NOT NULL REFERENCES approval_todos(id),
+    event_id      INTEGER NOT NULL REFERENCES approval_notify_events(id),
+    recipient     TEXT NOT NULL,
+    event_type    TEXT NOT NULL,
+    source_type   TEXT NOT NULL,
+    batch_id      INTEGER,
+    change_id     INTEGER,
+    node_id       INTEGER,
+    subject       TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL DEFAULT 0,     -- 待办创建顺序（=todo id），按序派发
+    status        TEXT NOT NULL DEFAULT 'pending', -- pending|in_flight|sent|failed|quarantined|cancelled
+    route_version INTEGER NOT NULL,               -- 入队时命中的路由版本（快照版本）
+    route_snapshot TEXT NOT NULL,                 -- 入队时通道计划快照 JSON（版本/通道/地址/条件）
+    plan_json     TEXT NOT NULL,                  -- [{channel,address,timeout_seconds,max_attempts,condition}]
+    attempt_index INTEGER NOT NULL DEFAULT 0,     -- 当前/下一尝试通道在计划中的下标
+    total_attempts INTEGER NOT NULL DEFAULT 0,
+    current_channel TEXT,
+    last_error    TEXT,
+    sent_channel  TEXT,
+    sent_at       REAL,
+    next_retry_at REAL,
+    round         INTEGER NOT NULL DEFAULT 1,     -- 发送轮次：requeue 开新一轮，窗口连续失败按轮内统计
+    quarantined_at REAL,
+    cancelled_reason TEXT,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    UNIQUE (event_id, recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_notif_send_pick
+    ON notif_send_tasks(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_notif_send_todo ON notif_send_tasks(todo_id);
+CREATE INDEX IF NOT EXISTS idx_notif_send_recipient ON notif_send_tasks(recipient, status);
+
+-- 每次通道尝试一行（含恢复探针）：result=success|failure|timeout，duration 秒。
+-- 熔断窗口统计「该通道最近 window_seconds 内、自上次成功以来的连续失败数」即查本表。
+CREATE TABLE IF NOT EXISTS notif_send_attempts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL REFERENCES notif_send_tasks(id),
+    channel     TEXT NOT NULL,
+    attempt_index INTEGER NOT NULL,
+    round       INTEGER NOT NULL,
+    probe       INTEGER NOT NULL DEFAULT 0,   -- 1=熔断恢复探针（half_open 唯一一条）
+    result      TEXT NOT NULL,               -- success|failure|timeout
+    duration    REAL,
+    error       TEXT,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_attempts_task ON notif_send_attempts(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_notif_attempts_channel
+    ON notif_send_attempts(channel, created_at);
+
+-- 通道切换历史：首选选中、每次切换（原因 timeout/consecutive_failures/breaker_open/
+-- channel_disabled/no_address）、最终成功或计划全部耗尽。管理员查询切换轨迹用。
+CREATE TABLE IF NOT EXISTS notif_channel_switches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL REFERENCES notif_send_tasks(id),
+    event_id    INTEGER NOT NULL,
+    recipient   TEXT NOT NULL,
+    from_channel TEXT,
+    to_channel  TEXT,
+    reason      TEXT NOT NULL,               -- selected|timeout|consecutive_failures|breaker_open|channel_disabled|no_address|plan_exhausted
+    detail      TEXT NOT NULL DEFAULT '{}',
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_switches_task ON notif_channel_switches(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_notif_switches_channel
+    ON notif_channel_switches(to_channel, id);
 """
 
 

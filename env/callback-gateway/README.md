@@ -34,6 +34,13 @@
                 │   审批委托（生效/失效/撤销/再激活）                      │
                 │     /admin/replay-delegations/*                      │
                 │   重放副作用走同一 outbox 幂等链路                     │
+                ├────────────────────────────────────────────────────┤
+                │ 通知通道路由与故障转移  /admin/approval-notifications/routing/* │
+                │   按事件类型配置 email/webhook/inbox 优先级·启用·接收条件     │
+                │   版本化路由快照：任务按入队版本选道，发布/回滚不影响在途任务 │
+                │   首选超时或连续失败才切换下一通道；尝试/切换/结果全程留痕    │
+                │   时间窗口失败熔断：open 不派新请求，半开探针成功才恢复接流量 │
+                │   同事件×接收人跨通道只一条业务通知（重启/重扫/并发幂等）     │
                 └────────────────────────────────────────────────────┘
 ```
 
@@ -102,6 +109,15 @@
 | 聚合/延迟/升级/取消/恢复可查询 | `GET .../aggregation-rules`、`.../aggregation-groups`（组状态+成员+摘要投递）、`.../quiet-schedules`、`.../escalation-policies`、`.../escalations`（每级触发时间/接收人/停止原因）；待办视图内嵌 held/delayed 通道与升级链，看板增加 held/delayed/aggregated 计数 |
 | 聚合/延迟/升级/取消/恢复全程审计 | `approval_delivery_held`、`approval_aggregation_group_flushed/cancelled`、`approval_delivery_delayed/released`、`approval_escalation_armed/fired/stopped`、各配置 `_set` 事件全部落 `events` |
 | 重启/重复事件/并发扫描不重发不漏发 | 所有状态转移为写事务内条件 UPDATE + 唯一索引（组、升级链、级别、事件 event_key、待办 event+recipient）；worker 步骤序：静默放行→截止提醒→对账→升级扫描→聚合刷新→投递；通道 IO 在事务外，崩溃重启后从库内状态继续 |
+| 运营按事件类型配置通道优先级/启用/接收条件 | `notif_route_versions` 版本化路由：规则按 event_type（缺省规则兜底）匹配，通道链按 priority 排序、可 enabled、可带 condition（actionable/source_type/risk_level/recipients 白名单），见 `app/notif_routing.py` |
+| 发送任务按当前版本路由快照选通道 | 任务入队时固化 `route_version`+`route_snapshot`+有序 `plan_json`（含每道地址/超时/尝试次数/条件）；之后发布新版本或回滚都不改变已入队任务 |
+| 首选通道超时或连续失败才切换下一通道 | 超时（`timeout_seconds`，工作线程强杀）立即切换；其他失败在本通道按 `max_attempts` 指数退避重试，达上限才切换；每次尝试落 `notif_send_attempts`，每次切换落 `notif_channel_switches`（selected/timeout/consecutive_failures/breaker_open/channel_disabled/no_address/plan_exhausted） |
+| 通道按时间窗口统计失败熔断、自动恢复 | `notif_channel_state`：窗口内连续失败（超时计失败，成功即重新计数）达阈值 open；open 期间不派新请求；冷却后 half_open 放唯一探针，探针成功才 closed 接流量、失败回 open |
+| 熔断期间不向该通道派新请求 | 派发闸门 `_admit_for_dispatch`：disabled/open（未到冷却）直接挡下，任务切换下一通道（原因 breaker_open/channel_disabled）；计划全部不可用时等待最近恢复时刻，不隔离、不丢通知 |
+| 同一事件对同一接收人不同通道不重复通知 | `notif_send_tasks UNIQUE(event_id,recipient)`：一个事件×接收人只一条任务，沿通道链成功一条即 sent；inbox 为末位兜底（站内待办始终即时生成），外发全挂也不漏关键通知 |
+| 重启/重复扫描/并发发送不越幂等 | 领取是条件 UPDATE（pending/failed→in_flight 单赢家）；启动 recover 把 in_flight 退回 pending；尝试与熔断统计只增落库，崩溃后从库内状态继续，不重发已成功通道 |
+| 查询路由版本/待发任务/通道健康/切换历史/审计 | `GET .../routing/current`·`/versions`、`/tasks`(+/tasks/{id} 含 attempts/switches)、`/channels/health`、`/switches`、`/attempts`；审计走 `events`（`notif_route_*`/`notif_send_*`/`notif_channel_*`） |
+| 发布新版本/回滚不影响已入队任务 | 发布整份生效（版本号单调递增，失败落 rejected 保留现版）；回滚到上一生效版本（原因必填）只推进 `notif_route_current` 指针，只影响之后入队的任务 |
 | Docker 部署 | `Dockerfile` + `docker-compose.yml` |
 
 ## 快速开始
@@ -115,7 +131,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 182 个端到端测试
+python -m pytest tests/          # 208 个端到端测试
 uvicorn app.main:create_app --factory --reload
 ```
 
@@ -792,6 +808,113 @@ curl 'localhost:8000/admin/approval-notifications/escalations?batch_id=7'
 `delivery_aggregated`/`delivery_pending`/`delivery_sent` 计数（均可按接收人过滤）。
 
 
+## 通知通道路由与故障转移
+
+在既有通知、待办与升级链路之上，运营可以为**不同事件类型**配置 `email` / `webhook` /
+`inbox`（站内）三类通道的**优先级、启用状态与接收条件**，并得到**版本化快照、有序故障
+转移、按时间窗口的失败熔断与自动恢复**（`app/notif_routing.py`）。
+
+- **互斥与兼容**：从未发布过路由版本时，通知完全走旧链路（联系人 `channels` +
+  聚合/静默，行为不变）。一旦发布路由版本，之后新生成的待办改走本模块；聚合/静默只
+  作用于旧链路，路由链路的「何时发」由熔断/退避决定，站内待办始终即时逐条生成。
+- **一个事件 × 接收人只有一条业务通知**：路由链路为每个待办入**一条**发送任务
+  （`UNIQUE(event_id,recipient)`），沿有序通道计划尝试，成功一条即终态；`inbox` 是
+  末位兜底（待办本身已即时落盘，走到 inbox 只记一次成功确认），外发通道全挂也不漏关键
+  审批通知。已在旧链路发出的通知不会被路由链路重复（二者按是否发布过版本互斥）。
+
+### 1) 发布路由版本（整份生效，失败保留现版）
+
+```bash
+curl -X POST localhost:8000/admin/approval-notifications/routing/versions \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","note":"邮件优先、webhook 兜底、站内兜底",
+       "rules":[
+         {"event_type":"activated","channels":[
+            {"channel":"email","priority":10,"max_attempts":2,"timeout_seconds":5,
+             "condition":{"actionable":true,"risk_level":"high"}},
+            {"channel":"webhook","priority":20,"max_attempts":3},
+            {"channel":"inbox","priority":99}]},
+         {"event_type":null,"channels":[
+            {"channel":"webhook"},{"channel":"email"},{"channel":"inbox"}]}
+       ],
+       "breaker":{
+         "email":{"failure_threshold":5,"window_seconds":60,"cooldown_seconds":30},
+         "webhook":{"failure_threshold":3,"window_seconds":60,"cooldown_seconds":30}}}'
+# -> {"result":"applied","version":1}
+```
+
+- `rules` 按 `event_type` 匹配（`null`/缺省/`"*"` 为缺省规则；显式规则优先；都没有时
+  用内置兜底计划 `email → webhook → inbox`）。同一事件类型不可重复。
+- `channels` 是该事件的**有序故障转移链**（`priority` 升序，缺省 100）；可 `enabled:false`
+  暂时停用；`condition` 支持 `actionable`、`source_type`（batch/change）、
+  `risk_level`（仅 batch）、`recipients`（接收人白名单）——不满足条件的通道不进入本次计划。
+- 每通道可配 `timeout_seconds`（超时**立即切换**，不在本通道重试）与
+  `max_attempts`（其他失败在本通道按指数退避重试的次数，**达上限才切换**；缺省取
+  `NOTIF_MAX_ATTEMPTS`，inbox 恒为 1）。
+- 校验失败返回 `422` 并落一条 `rejected` 版本记录，当前版本原样保留。
+
+### 2) 发送、故障转移与熔断（worker 自动完成）
+
+- 任务入队即固化版本与通道计划快照（地址、超时、尝试次数、条件）；worker 按
+  `(ordinal,id)`（原事件顺序）领取，领取是条件 UPDATE（单赢家）。
+- **熔断统计按时间窗口**：通道在 `window_seconds` 内「自最近一次成功起的连续失败数」
+  （超时计失败）达到 `failure_threshold` 即 `open`，落 `notif_channel_opened` 审计。
+- **open 期间不派新请求**：新任务遇到首选 open 直接从下一通道开始（切换原因
+  `breaker_open`，不消耗该通道尝试次数）；计划全部通道此刻不可用时，任务等待最近一个
+  open 通道的冷却时刻（`pending`，不隔离、不丢通知）。
+- **自动恢复**：open 冷却 `cooldown_seconds` 后转 `half_open`，只放**一条恢复探针**
+  （条件更新保证唯一）；探针成功 → `closed` 重新接流量（`notif_channel_recovered`），
+  探针失败 → 立即回 `open`。
+- 每次尝试落 `notif_send_attempts`（成功/失败/超时、耗时、探针标记）；每次通道选择与
+  切换落 `notif_channel_switches`（含原因与详情）；最终 `sent` / `quarantined`。
+- 全部外发通道耗尽且计划无 inbox 兜底时任务 `quarantined`，可人工
+  `POST .../routing/tasks/{id}/requeue` 从首选通道开**新一轮**（round+1，失败重新计数）。
+
+### 3) 版本发布 / 回滚不影响已入队任务
+
+```bash
+# 发布 v2（只影响之后入队的任务；在途任务继续按 v1 快照）
+curl -X POST .../routing/versions -d '{"operator":"ops-b","rules":[...]}'
+# 回滚到上一生效版本（原因必填），同样只影响之后入队的任务
+curl -X POST .../routing/rollback -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-b","reason":"紧急止损"}'
+# -> {"result":"rolled_back","version":1}
+```
+
+### 4) 管理查询与手工干预
+
+```bash
+# 当前版本 + 配置快照 + 是否可回滚
+curl .../routing/current
+# 版本历史（applied / rollback / rejected）
+curl .../routing/versions
+# 待发送/在途/已发送/隔离/取消任务（?history=true 带尝试与切换历史）
+curl '.../routing/tasks?status=sent&route_version=1&event_type=activated'
+curl .../routing/tasks/12
+# 通道健康：state(closed/open/half_open)、窗口连续失败、冷却/探针
+curl .../routing/channels/health
+# 切换历史 / 每次尝试
+curl '.../routing/switches?reason=consecutive_failures'
+curl '.../routing/attempts?channel=webhook&result=timeout'
+# 启用/停用通道、调整熔断参数，或排障后强制复位 closed
+curl -X POST .../routing/channels/webhook/state -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","enabled":true,"reset":true}'
+```
+
+> `inbox` 为站内兜底通道，不可停用、不会被熔断。待办被处理/对账关闭、联系人停用或升级
+> 停止时，其未发出的发送任务在同一事务置 `cancelled`（已发出的外部效果轨迹保留）。
+
+审计事件：`notif_route_published` / `notif_route_rolled_back` / `notif_route_rejected`、
+`notif_send_task_enqueued` / `notif_send_skipped` / `notif_send_sent` /
+`notif_send_retry_scheduled` / `notif_send_quarantined` / `notif_send_requeued` /
+`notif_send_cancelled` / `notif_send_awaiting_channels` / `notif_send_task_recovered`、
+`notif_channel_switched` / `notif_channel_opened` / `notif_channel_probe_started` /
+`notif_channel_probe_failed` / `notif_channel_recovered` / `notif_channel_state_set`。
+看板 `GET .../summary` 增加 `route_pending`/`route_in_flight`/`route_sent`/
+`route_quarantined`/`route_cancelled` 计数（可按接收人过滤）；待办视图内嵌 `route_task`
+（计划、每次尝试与切换）。
+
+
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -809,6 +932,10 @@ curl 'localhost:8000/admin/approval-notifications/escalations?batch_id=7'
 | `NOTIF_RETRY_CAP_SECONDS` | `300` | 审批通知重试间隔上限 |
 | `NOTIF_MAX_ATTEMPTS` | `5` | 审批通知连续发送失败上限，超过进隔离队列（可人工 requeue） |
 | `NOTIF_DEADLINE_LEAD_SECONDS` | `300` | 审批截止前多少秒生成「即将到期」待办（每节点/变更单至多一次） |
+| `NOTIF_BREAKER_WINDOW_SECONDS` | `60` | 通道熔断失败统计窗口（秒）：窗口内自上次成功起的连续失败达阈值即熔断 |
+| `NOTIF_BREAKER_FAILURE_THRESHOLD` | `5` | 窗口内连续失败多少次熔断（可在发布路由时按通道覆盖） |
+| `NOTIF_BREAKER_COOLDOWN_SECONDS` | `30` | 熔断 open 后多久允许一条 half_open 恢复探针 |
+| `NOTIF_CHANNEL_TIMEOUT_SECONDS` | `10` | 通道发送超时兜底（秒，可按通道 `timeout_seconds` 覆盖）；超时立即切换下一通道 |
 | `RUN_WORKER` | `true` | 是否在本进程跑后台 worker |
 
 ## 设计要点
@@ -838,6 +965,16 @@ curl 'localhost:8000/admin/approval-notifications/escalations?batch_id=7'
 - **并发配额实时推导**：批次占用量 = 该批 `processing` 任务数，领取与复核在同一
   写事务里完成（SQLite 写事务串行，多副本也不会超领）；不维护任何计数器，
   因此暂停/取消/崩溃重启都不存在「忘了释放」的路径。
+- **通道路由快照隔离**：发送任务入队时固化路由版本与有序通道计划（地址/超时/尝试
+  次数/接收条件），随后发布新版本或回滚只推进 `notif_route_current` 指针，只影响之后
+  入队的任务；在途任务始终按自己的快照选道，不存在「跨版本混搭」或无计划窗口。
+- **熔断零计数器**：通道熔断状态（closed/open/half_open）只存状态行，「窗口内连续
+  失败数」实时查只增的 `notif_send_attempts`（找到窗口内最近一次成功，数其后失败），
+  因此不存在计数器漂移/漏复位；half_open 探针用条件 UPDATE 归属，保证并发下唯一探针。
+- **故障转移与幂等**：一个事件×接收人只有一条发送任务（UNIQUE 兜底重启/重复扫描/
+  并发），通道链成功一条即终态，跨通道不重复通知；超时由进程级线程池强杀并立即切换，
+  其他失败在本通道退避重试到 `max_attempts` 才切换；熔断中跳过的通道不消耗尝试次数，
+  计划全不可用时等待恢复而非隔离，inbox 末位兜底保证关键通知不因外发全挂而漏发。
 - **老库就地升级**：首次以新版本打开旧库时自动给 `outbox` 补 `replay_task_id` 列、
   给 `replay_batches`/`replay_tasks` 补 `max_concurrency`/`delivery_created_at`/
   `blocked_reason` 列（存量任务的排序键从 deliveries 回填），给 `replay_batches`
@@ -855,3 +992,7 @@ curl 'localhost:8000/admin/approval-notifications/escalations?batch_id=7'
   并给 `approval_notification_deliveries` 补 `group_id`/`delayed_until`/`ordinal`
   列（存量投递的 ordinal 回填为投递 id）、给 `approval_todos` 补 `open_at`
   （回填为 created_at）；升级前不存在规则/计划/策略，存量通知行为与升级前完全一致。
+  通道路由功能再打开时新建 `notif_route_versions`/`notif_route_current`/
+  `notif_send_tasks`/`notif_send_attempts`/`notif_channel_switches`/
+  `notif_channel_state` 表；当前路由版本指针初始为 NULL，因此发布路由版本之前所有通知
+  仍走旧链路，存量行为完全不变，首次发布后新通知才改走版本化路由/熔断/故障转移。

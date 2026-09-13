@@ -292,6 +292,27 @@ def _create_todos(cur: sqlite3.Cursor, event_row: sqlite3.Row,
             # UNIQUE(event_id, recipient)：重放/并发下该接收人已有待办，跳过
             continue
         todo_id = cur.lastrowid
+        # 已发布通知通道路由版本时，该待办走版本化路由/熔断/故障转移链路（一个事件×
+        # 接收人一条发送任务，跨通道不重复通知）；否则走旧的「按联系人通道逐条投递」。
+        from . import notif_routing
+        routed = notif_routing.enqueue_for_todo_tx(
+            cur, todo=cur.execute("SELECT * FROM approval_todos WHERE id=?",
+                                  (todo_id,)).fetchone(),
+            event=event_row, settings=notif_routing._settings_at(cur), now=now)
+        if routed["routed"]:
+            audit.record(cur, "approval_todo_generated", None, None, {
+                "todo_id": todo_id, "notify_event_id": event_row["id"],
+                "event_type": event_row["event_type"],
+                "source_type": event_row["source_type"],
+                "source_batch_id": event_row["batch_id"],
+                "change_id": event_row["change_id"], "node_id": event_row["node_id"],
+                "recipient": recipient, "event_version": event_row["state_version"],
+                "actionable": bool(event_row["actionable"]),
+                "routed": True, "route_task_id": routed["task_id"],
+                "route_plan": routed["plan"],
+                "route_skipped_reason": routed["skipped_reason"]}, ts=now)
+            created += 1
+            continue
         routing = _insert_deliveries(
             cur, todo_id, recipient, event_row["subject"], event_row["body"],
             json.loads(event_row["payload"]), now)
@@ -660,6 +681,10 @@ def sweep_stale_todos(db: Database, now: float | None = None) -> int:
                 """UPDATE approval_notification_deliveries SET status='cancelled',
                    updated_at=? WHERE todo_id=? AND status IN ('pending','failed','held','delayed')""",
                 (now, todo["id"]))
+            # 路由发送任务（若该待办走版本化路由链路）同事务取消
+            from . import notif_routing
+            notif_routing.cancel_tasks_for_todo_tx(
+                cur, todo["id"], "todo_closed", now)
             # 来源落定：升级随之停止（后续级别不再触发，已升级别未发出投递取消）
             from . import notif_policy
             notif_policy.stop_escalations_for_todo_tx(
@@ -757,6 +782,9 @@ def act_on_todo(db: Database, todo_id: int, req: TodoActRequest) -> dict:
                 """UPDATE approval_notification_deliveries SET status='cancelled',
                    updated_at=? WHERE todo_id=? AND status IN ('pending','failed','held','delayed')""",
                 (now, todo_id))
+            from . import notif_routing
+            notif_routing.cancel_tasks_for_todo_tx(
+                cur, todo_id, "todo_closed", now)
             from . import notif_policy
             notif_policy.stop_escalations_for_todo_tx(
                 cur, todo_id, reason="source_closed", now=now)
@@ -803,6 +831,9 @@ def act_on_todo(db: Database, todo_id: int, req: TodoActRequest) -> dict:
             """UPDATE approval_notification_deliveries SET status='cancelled',
                updated_at=? WHERE todo_id=? AND status IN ('pending','failed','held','delayed')""",
             (now, todo_id))
+        # 该待办的版本化路由发送任务同事务取消（已发出的外部效果轨迹保留）
+        from . import notif_routing
+        notif_routing.cancel_tasks_for_todo_tx(cur, todo_id, "handled", now)
         # 原接收人处理后升级通知必须停止：后续级别不再触发，已升级别未发出的投递取消
         # （同事务，与原决定原子提交）。
         from . import notif_policy
@@ -868,9 +899,42 @@ def _todo_view(cur: sqlite3.Cursor, todo, now: float) -> dict:
         "failed_channels": failed, "quarantined_channels": quarantined,
         "held_channels": held, "delayed_channels": delayed,
         "aggregated_channels": aggregated,
+        # 版本化路由链路（发布过路由版本后）：该待办的发送任务、尝试与切换
+        "route_task": _route_task_view(cur, todo["id"]),
         # 该待办作为「原始接收人待办」时的升级状态（未升级为 None）
         "escalation": _escalation_view(cur, todo["id"]),
     }
+
+
+def _route_task_view(cur: sqlite3.Cursor, todo_id: int) -> dict | None:
+    """待办内嵌的版本化路由发送任务（含尝试与切换历史）；未走路由链路时为 None。"""
+    task = cur.execute("SELECT * FROM notif_send_tasks WHERE todo_id=?",
+                       (todo_id,)).fetchone()
+    if task is None:
+        return None
+    attempts = cur.execute(
+        "SELECT * FROM notif_send_attempts WHERE task_id=? ORDER BY id",
+        (task["id"],)).fetchall()
+    switches = cur.execute(
+        "SELECT * FROM notif_channel_switches WHERE task_id=? ORDER BY id",
+        (task["id"],)).fetchall()
+    return {
+        "id": task["id"], "status": task["status"],
+        "route_version": task["route_version"],
+        "plan": [p["channel"] for p in json.loads(task["plan_json"])],
+        "attempt_index": task["attempt_index"],
+        "current_channel": task["current_channel"],
+        "sent_channel": task["sent_channel"], "sent_at": task["sent_at"],
+        "total_attempts": task["total_attempts"], "round": task["round"],
+        "next_retry_at": task["next_retry_at"], "last_error": task["last_error"],
+        "cancelled_reason": task["cancelled_reason"],
+        "attempts": [{"channel": a["channel"], "result": a["result"],
+                      "probe": bool(a["probe"]), "duration": a["duration"],
+                      "error": a["error"], "created_at": a["created_at"]}
+                     for a in attempts],
+        "switches": [{"from_channel": s["from_channel"],
+                      "to_channel": s["to_channel"], "reason": s["reason"],
+                      "created_at": s["created_at"]} for s in switches]}
 
 
 def _escalation_view(cur: sqlite3.Cursor, todo_id: int) -> dict | None:
@@ -988,6 +1052,16 @@ def todo_summary(db: Database, recipient: str | None = None) -> dict:
         dsql += " WHERE " + " AND ".join(dwhere)
     dsql += " GROUP BY d.status"
     delivery_counts = {r["status"]: r["c"] for r in db.query(dsql, tuple(dparams))}
+    # 版本化路由发送任务计数（可按接收人过滤）
+    rsql = "SELECT status, COUNT(*) AS c FROM notif_send_tasks"
+    rwhere, rparams = [], []
+    if recipient:
+        rwhere.append("recipient=?")
+        rparams.append(recipient)
+    if rwhere:
+        rsql += " WHERE " + " AND ".join(rwhere)
+    rsql += " GROUP BY status"
+    route_counts = {r["status"]: r["c"] for r in db.query(rsql, tuple(rparams))}
     return {
         "recipient": recipient,
         "unread": counts.get(TODO_UNREAD, 0),
@@ -1003,6 +1077,12 @@ def todo_summary(db: Database, recipient: str | None = None) -> dict:
         "delivery_aggregated": delivery_counts.get(DELIVERY_AGGREGATED, 0),
         "delivery_delayed": delivery_counts.get(DELIVERY_DELAYED, 0),
         "delivery_sent": delivery_counts.get(DELIVERY_SENT, 0),
+        # 版本化路由链路（发布过路由版本后才有）：待发/在途/已发/隔离/取消
+        "route_pending": route_counts.get("pending", 0),
+        "route_in_flight": route_counts.get("in_flight", 0),
+        "route_sent": route_counts.get("sent", 0),
+        "route_quarantined": route_counts.get("quarantined", 0),
+        "route_cancelled": route_counts.get("cancelled", 0),
     }
 
 
@@ -1138,6 +1218,10 @@ def deactivate_contact(db: Database, name: str, req: ContactDeactivateRequest) -
                 """UPDATE approval_notification_deliveries SET status='cancelled',
                    updated_at=? WHERE todo_id=? AND status IN ('pending','failed','held','delayed')""",
                 (now, t["id"]))
+            # 版本化路由发送任务一并取消
+            from . import notif_routing
+            notif_routing.cancel_tasks_for_todo_tx(
+                cur, t["id"], "contact_deactivated", now)
             # 联系人停用：其原始待办的升级链一并停止
             notif_policy.stop_escalations_for_todo_tx(
                 cur, t["id"], reason="source_closed", now=now)

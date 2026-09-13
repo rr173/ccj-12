@@ -27,6 +27,7 @@ from .ingest import ingest
 from .keyconfig import KeyConfigStore, KeyRotationService
 from .notif_worker import NotificationWorker
 from .notif_policy import create_notif_policy_router
+from .notif_routing import configure_routing, create_routing_router
 from .notifications import create_notifications_router
 from .replay import ReplayWorker, create_replay_router
 from .replay_policy import create_policy_router
@@ -47,11 +48,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     worker = Worker(db, settings)
     replay_worker = ReplayWorker(db, settings)
     notif_worker = NotificationWorker(db, settings)
+    # 通知通道路由：在业务事务内入队时读取的默认熔断/超时配置
+    configure_routing(settings)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         # 重启恢复：上次未完成（卡在 processing）的重放任务退回待处理，从上次位置继续
         replay_worker.recover()
+        # 通知路由：卡在 in_flight 的发送任务退回 pending（尝试/熔断状态都在库里）
+        notif_worker.recover()
         tasks = []
         if settings.run_worker:
             tasks.append(asyncio.create_task(worker.run_forever()))
@@ -112,6 +117,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(create_notifications_router(
         db, settings, lambda: notif_worker.senders))
     app.include_router(create_notif_policy_router(db, settings))
+    app.include_router(create_routing_router(
+        db, settings, lambda: notif_worker.senders))
     return app
 
 
