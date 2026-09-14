@@ -948,7 +948,9 @@ curl -X POST .../routing/channels/webhook/state -H 'Content-Type: application/js
 - **草稿 → 发布**：运营为 `event_type`（支持 `*` 通配）× `channel`
   （`email`/`webhook`/`inbox`/`*`）维护草稿，声明变量（必填、默认值、`sensitive`、
   类型 `string|int|number|bool`）、各语言标题/正文、可用语言与语言回退顺序。发布前整份
-  校验：占位符必须有声明、语言间占位符集合一致、敏感变量的每个占位符必须带 `|mask`、
+  校验：占位符必须有声明且语法为合法闭合的 `{name}`/`{name|mask}`（未闭合的
+  `{name`、孤立 `}` 等以 `unclosed_placeholder` 拒绝，绝不允许原样正文发出）、语言间
+  占位符集合一致、敏感变量的每个占位符必须带 `|mask`、
   必填变量必须被使用；失败落 `rejected` 版本记录（原因可查），当前指针不动。
 - **语言回退**：入队时按接收人语言偏好（联系人 `language`，缺省取
   `NOTIF_DEFAULT_LANGUAGE`）选择版本，回退链 = 接收人语言 → 模板声明
@@ -957,7 +959,9 @@ curl -X POST .../routing/channels/webhook/state -H 'Content-Type: application/js
 - **不能发送的情形**：变量缺失（`missing_variable`）、类型不符（`type_mismatch`）、
   正文/标题超通道限制（`body_too_long`/`subject_too_long`，限制见
   `NOTIF_*_MAX` 配置）、敏感变量原文出现在正文（`sensitive_unmasked`，`|mask` 保留
-  末 4 位）。失败写入 `notif_template_render_failures`，可按接收人/事件/通道/原因查询。
+  末 4 位）、占位符未闭合/语法非法（`unclosed_placeholder`/`render_error`，发布校验
+  已挡；渲染侧另有深度防护，历史脏数据也只会阻断而不会把原样正文发出）。失败写入
+  `notif_template_render_failures`，可按接收人/事件/通道/原因查询。
 - **固化**：发送任务在**入队事务内**为计划中每个通道渲染一次，模板版本、语言、回退链、
   变量快照（敏感值只存脱敏值）、最终标题/正文/webhook 负载与正文 SHA-256 随
   `notif_send_tasks.content_snapshot` 固化；发送器与重试只读固化正文。之后编辑/发布

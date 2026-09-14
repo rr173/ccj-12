@@ -7,10 +7,12 @@
 模板版本（notif_template_versions / notif_template_current）
 - 运营先创建草稿（每个 event_type+channel 至多一份 draft），可反复编辑：声明必填变量、
   默认值、敏感变量、值类型，以及各语言标题/正文、可用语言与语言回退顺序；
-- 发布前整份校验：占位符必须都有声明、声明变量的类型/默认值合法、敏感变量在每个用到它
-  的占位符上必须脱敏（|mask）、每门语言标题/正文非空且占位符一致；校验失败落 rejected
-  记录（原因可查），当前指针不动；通过则发布为不可变版本（键内版本号单调递增）并推进
-  notif_template_current 指针；
+- 发布前整份校验：占位符必须都有声明且语法为合法闭合的 {name}/{name|mask}
+  （未闭合的 {name、孤立 } 以 unclosed_placeholder 拒绝）、声明变量的类型/默认值合法、
+  敏感变量在每个用到它的占位符上必须脱敏（|mask）、每门语言标题/正文非空且占位符一致；
+  校验失败落 rejected 记录（原因可查），当前指针不动；通过则发布为不可变版本（键内版本号
+  单调递增）并推进 notif_template_current 指针；渲染侧另对占位符做同样的语法扫描，保证
+  即便有绕过发布的脏数据，未闭合片段也只会阻断渲染，绝不会把原样正文发出去；
 - event_type/channel 支持 '*' 通配，解析顺序：精确(event,channel) -> (event,'*') ->
   ('*',channel) -> ('*','*')；四处都没有则视为该通道未配置模板（沿用事件静态正文，
   存量行为完全不变）。
@@ -81,6 +83,7 @@ REASON_TYPE_MISMATCH = "type_mismatch"
 REASON_BODY_TOO_LONG = "body_too_long"
 REASON_SUBJECT_TOO_LONG = "subject_too_long"
 REASON_SENSITIVE_UNMASKED = "sensitive_unmasked"
+REASON_UNCLOSED_PLACEHOLDER = "unclosed_placeholder"
 REASON_RENDER_ERROR = "render_error"
 
 # 发送任务的渲染失败终态（区别于通道故障的 quarantined：模板问题重试通道无意义，
@@ -88,8 +91,13 @@ REASON_RENDER_ERROR = "render_error"
 TASK_RENDER_FAILED = "render_failed"
 
 # 占位符语法：{name} 或 {name|mask}；不支持表达式/嵌套（避免模板注入）
-PLACEHOLDER_RE = re.compile(r"^\{([a-zA-Z_][a-zA-Z0-9_]*)(?:\|(mask))?\}$")
+# PLACEHOLDER_FIND_RE 只负责对已通过语法扫描的文本做替换；检测未闭合/非法片段见
+# _scan_placeholders（finditer 会静默忽略未闭合的 {name，不能用于校验）。
 PLACEHOLDER_FIND_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)(?:\|(mask))?\}")
+# 完整占位符内部语法（{name} / {name|mask}）；| 后只允许 mask
+PLACEHOLDER_INNER_RE = re.compile(r"([a-zA-Z_][a-zA-Z0-9_]*)(?:\|(mask))?")
+# 按对扫描大括号：每个 '{' 必须配对 '}'，否则就是未闭合/孤立片段
+BRACE_SCAN_RE = re.compile(r"[{}]")
 
 # ---- 请求模型 ----------------------------------------------------------------
 
@@ -227,25 +235,52 @@ def _norm_definition(req: dict) -> dict:
             "texts": texts, "languages": sorted(langs), "fallback_languages": fallback}
 
 
-def _extract_placeholders(text: str) -> list[tuple[str, str | None]]:
-    """提取文本中的占位符（名称, 过滤器）。{ 未闭合或名称非法即视为非法占位符。"""
+def _scan_placeholders(text: str) -> list[tuple[str, str | None]]:
+    """逐字符扫描大括号：每个 '{' 必须在其后（下一个 '{' 之前）配对 '}'，
+    且括号内必须是 {name} / {name|mask}；孤立 '}' 同样拒绝。
+
+    这样未闭合的 '{name'、'{1a}'、'{ a }'、'{name|x}'、孤立 '}' 都不会漏过，
+    也不会被替换正则静默忽略后把原文发送出去。
+    """
     out: list[tuple[str, str | None]] = []
-    for m in PLACEHOLDER_FIND_RE.finditer(text):
-        out.append((m.group(1), m.group(2)))
-    # 检测形似占位符但无法解析的片段（{name|x}、{1a}、{ a }、未闭合的 {）
-    for raw in re.findall(r"\{[^{}]*\}", text):
-        if not PLACEHOLDER_RE.match(raw):
-            raise TemplateError(REASON_RENDER_ERROR,
-                                f"invalid placeholder syntax {raw!r}: only {{name}} or "
-                                "{name|mask} are supported")
-    return out
+    pos = 0
+    while True:
+        m = BRACE_SCAN_RE.search(text, pos)
+        if m is None:
+            return out
+        if m.group() == "}":
+            raise TemplateError(REASON_UNCLOSED_PLACEHOLDER,
+                                "unmatched '}' without an opening '{'")
+        start = m.end()
+        close = text.find("}", start)
+        reopen = text.find("{", start)
+        if close == -1 or (reopen != -1 and reopen < close):
+            fragment = text[start: reopen if reopen != -1 else len(text)]
+            raise TemplateError(
+                REASON_UNCLOSED_PLACEHOLDER,
+                f"unclosed placeholder {('{' + fragment)!r}: missing '}}'")
+        inner = text[start:close]
+        im = PLACEHOLDER_INNER_RE.fullmatch(inner)
+        if im is None:
+            raise TemplateError(
+                REASON_RENDER_ERROR,
+                f"invalid placeholder syntax {('{' + inner + '}')!r}: only "
+                "{{name}} or {name|mask} are supported")
+        out.append((im.group(1), im.group(2)))
+        pos = close + 1
+
+
+def _extract_placeholders(text: str) -> list[tuple[str, str | None]]:
+    """提取文本中的占位符（名称, 过滤器）。未闭合的 {、孤立 } 或名称非法即报错。"""
+    return _scan_placeholders(text)
 
 
 def validate_definition(defn: dict) -> list[str]:
     """发布前整份校验，返回警告列表；发现硬错误抛 TemplateError（第一个错误）。
 
-    硬错误：未知占位符、未知过滤器、敏感变量未在所有占位符上脱敏、语言间占位符不一致、
-    必填变量未被任何文本使用（按需求「校验变量定义与正文占位符」）、标题/正文为空。
+    硬错误：未闭合/非法占位符、未知占位符、未知过滤器、敏感变量未在所有占位符上脱敏、
+    语言间占位符不一致、必填变量未被任何文本使用（按需求「校验变量定义与正文占位符」）、
+    标题/正文为空。
     """
     variables = {v["name"]: v for v in defn["variables"]}
     warnings: list[str] = []
@@ -408,6 +443,11 @@ def effective_variables(declarations: list[dict], supplied: dict) -> dict:
 
 
 def _render_text(text: str, values: dict, declarations: dict[str, dict]) -> str:
+    # 深度防护：模板正文必须全部是合法且闭合的占位符，未闭合/非法片段直接阻断，
+    # 绝不允许被替换正则静默忽略后把形如 {name 的原文发送出去（发布校验已挡，
+    # 这里防历史脏数据/绕过发布的版本）。
+    _scan_placeholders(text)
+
     def repl(m: re.Match) -> str:
         name, filt = m.group(1), m.group(2)
         if name not in values:

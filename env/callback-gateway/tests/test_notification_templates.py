@@ -260,6 +260,99 @@ def test_publish_rejected_on_undeclared_placeholder_and_unknown_filter(env):
     assert v["valid"] is False and v["errors"][0]["code"] == "render_error"
 
 
+def test_publish_rejects_unclosed_placeholder(env):
+    """未闭合占位符（{name、孤立 }）必须在校验阶段被识别并拒绝发布。"""
+    client = env
+    # 正文里 {submitted_by 少了闭合 }
+    draft(client, variables=STANDARD_VARS, texts=[
+        {"language": "zh", "subject": "节点 {submitted_by}",
+         "body": "批次 {batch_id} 节点 {node_seq} 由 {submitted_by 提交"},
+        {"language": "en", "subject": "Node {submitted_by}",
+         "body": "Batch {batch_id} node {node_seq} by {submitted_by"}])
+
+    v = client.post(f"{TPL}/drafts/activated/email/validate").json()
+    assert v["valid"] is False
+    assert v["errors"][0]["code"] == "unclosed_placeholder"
+    assert "submitted_by" in v["errors"][0]["message"]
+
+    # 发布：422 + 明确原因，落 rejected 记录，不推进指针、不产生 published 版本
+    r = publish_template(client, expected=422).json()
+    assert r["detail"][0]["code"] == "unclosed_placeholder"
+    rejected = client.get(f"{TPL}/versions",
+                          params={"status": "rejected"}).json()["versions"]
+    assert len(rejected) == 1
+    reason = rejected[0]["rejection_reason"]
+    assert reason and reason[0]["code"] == "unclosed_placeholder"
+    assert client.get(f"{TPL}/current").json()["current"] == []
+    assert client.get(f"{TPL}/versions",
+                      params={"status": "published"}).json()["versions"] == []
+
+    # 修好缺失的闭合括号后可正常发布
+    update_draft(client, variables=STANDARD_VARS, texts=[
+        {"language": "zh", "subject": "节点激活 {submitted_by}",
+         "body": "批次 {batch_id} 节点 {node_seq} 由 {submitted_by} 提交"},
+        {"language": "en", "subject": "Node active {submitted_by}",
+         "body": "Batch {batch_id} node {node_seq} by {submitted_by}"}])
+    assert publish_template(client).json()["result"] == "published"
+
+
+def test_publish_rejects_stray_and_nested_brace_variants(env):
+    """孤立 }、'{a{' 这类花括号失衡同样拒绝，原因码稳定可查。"""
+    client = env
+    draft(client, variables=STANDARD_VARS)
+    bad_bodies = [
+        "批次 {batch_id} 节点 {node_seq} 由 {submitted_by}}",
+        "批次 {batch_id} 节点 { {node_seq}",
+    ]
+    for bad in bad_bodies:
+        update_draft(client, variables=STANDARD_VARS, texts=[
+            {"language": "zh", "subject": "S {submitted_by}", "body": bad},
+            {"language": "en", "subject": "S {submitted_by}",
+             "body": "Batch {batch_id} node {node_seq} by {submitted_by}"}])
+        v = client.post(f"{TPL}/drafts/activated/email/validate").json()
+        assert v["valid"] is False
+        assert v["errors"][0]["code"] in (
+            "unclosed_placeholder", "render_error")
+
+
+def test_corrupt_published_version_never_sends_raw_placeholder(env):
+    """深度防护：即便已发布版本的正文被绕过校验篡改成未闭合占位符，
+    渲染也必须阻断（render_failed + 失败记录），发送器拿不到原样正文。"""
+    client = env
+    sent = set_senders(client)
+    publish_routing(client, order=("email",))
+    draft(client, variables=STANDARD_VARS)
+    publish_template(client)
+
+    # 模拟绕过发布校验的历史脏数据：直接把已发布版本正文改成未闭合占位符
+    db = client.app.state.db
+    with db.tx() as cur:
+        row = cur.execute(
+            "SELECT bodies_json FROM notif_template_versions "
+            "WHERE event_type=? AND channel=? AND status='published'",
+            ("activated", "email")).fetchone()
+        bodies = json.loads(row["bodies_json"])
+        bodies["en"] = "Batch {batch_id} node {node_seq by SUBMITTER"
+        cur.execute(
+            "UPDATE notif_template_versions SET bodies_json=? WHERE event_type=? "
+            "AND channel=? AND status='published'",
+            (json.dumps(bodies, ensure_ascii=False), "activated", "email"))
+
+    todo = make_event(client, "R-BAD", language="en", channels=["email"],
+                      email="wang@example.com", webhook_url=None)
+    tid = todo["route_task"]["id"]
+    task = task_detail(client, tid)
+    assert task["status"] == "render_failed"
+    assert task["render_failure_reason"][0]["code"] == "unclosed_placeholder"
+    fl = failures(client, reason_code="unclosed_placeholder")
+    assert {f["channel"] for f in fl} == {"email"}
+    # worker 多轮也绝不把含 {node_seq 的原样正文发出去
+    for _ in range(2):
+        client.app.state.notif_worker.run_once()
+    assert [s for s in sent if s[0] == "email"] == []
+    assert task_detail(client, tid)["status"] == "render_failed"
+
+
 def test_publish_rejected_when_sensitive_not_masked(env):
     client = env
     variables = [{"name": "batch_id", "type": "int"},
