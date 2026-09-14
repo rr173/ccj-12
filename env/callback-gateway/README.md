@@ -1085,7 +1085,27 @@ curl -X POST localhost:8000/admin/approval-notifications/routing/tasks/12/receip
   -H 'Content-Type: application/json' -d '{"operator":"ops-admin","action":"retry"}'
 curl -X POST localhost:8000/admin/approval-notifications/routing/tasks/12/receipt-resolve \
   -H 'Content-Type: application/json' -d '{"operator":"ops-admin","action":"ignore"}'
+
+# 6) 失败回执复核案件：bounced（及 complained/expired）回执在驱动状态机的同时
+#    自动建案，与回执落盘同一事务。重复收到同一回执绝不生成第二条案件
+#    （case_key=receipt:{receipt_id}，UNIQUE 约束兜底）。
+curl 'localhost:8000/admin/receipt-review/cases?event_type=bounced&status=open'
+curl 'localhost:8000/admin/receipt-review/cases?recipient=wang@example.com'
+curl localhost:8000/admin/receipt-review/cases/3     # 案件 + 不可变证据 + 决定轨迹
 ```
+
+- **复核案件证据**：案件行冗余接收人 / 事件类型 / 通道 / 外部消息编号，便于列表筛选；
+  建案同时固化三类不可变证据快照（`receipt_review_evidence`，只增不改）——
+  kind=receipt 的**回执原文**（raw_body + 报文 SHA-256，即「原始消息证据」）、
+  kind=message 的外部消息登记行、kind=task 的路由发送任务。之后任何处理都不改写快照，
+  新事实只追加新行。
+- **幂等与归集**：逐字节重复投递在回执幂等层即返回首条，不重复建案；同一外部消息
+  内容不同的多条失败回执（如乱序迟到）归集进同一案件、各留一条回执证据；无法匹配
+  消息的失败回执也先建案（仅有回执证据），人工绑定 / 安全重放匹配到消息后**复用同一
+  案件**补全关联与消息/任务证据，绝不另开第二案。自动故障转移（on_bounced=retry）
+  不影响建案——管理员始终有一条可处理的 open 案件（默认 SLA 4h，策略在
+  `receipt_review_policy` 单例行）。
+
 
 - **发送侧返回 message_id**：可注入的 sender（`NotificationWorker.senders["email"/
   "webhook"]`）在成功时可 `return "外部编号"`；登记与发送成功在同一事务，崩溃不会出现
@@ -1106,6 +1126,9 @@ curl -X POST localhost:8000/admin/approval-notifications/routing/tasks/12/receip
   `receipt_manually_bound`、`receipt_ignored`、`receipt_replayed(s)`、
   `receipt_policy_set`、`receipt_key_rotated/retired/seeded`、
   `external_message_id_collision`，全部走只增的 `events` 表。
+- **复核案件审计事件**：`receipt_review_case_created`（自动建案）、
+  `receipt_review_evidence_appended`（同消息后续失败回执证据归集）、
+  `receipt_review_case_relinked`（待核对回执绑定/重放后复用案件并补全证据）。
 
 
 ## 通知状态对账与补偿

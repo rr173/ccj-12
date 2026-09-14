@@ -43,6 +43,7 @@ from pydantic import BaseModel
 from . import audit
 from .config import Settings
 from .db import Database
+from . import receipt_review
 
 log = logging.getLogger("gateway.receipts")
 
@@ -829,9 +830,15 @@ def ingest_receipt(db: Database, channel: str, raw: bytes,
                 "receipt_id": receipt_id, "channel": channel,
                 "message_id": message_id, "event": event,
                 "recipient": recipient}, ts=now)
+            # 失败回执即便匹配不上消息，也要给管理员留一条复核案件（回执证据已足够）
+            review = receipt_review.ensure_case_for_failure_receipt_tx(
+                cur, receipt=cur.execute("SELECT * FROM receipts WHERE id=?",
+                                         (receipt_id,)).fetchone(),
+                msg=None, ts=now)
             return 202, {"result": "unmatched", "receipt_id": receipt_id,
                          "message_id": message_id, "event": event,
-                         "status": "pending_review"}
+                         "status": "pending_review",
+                         "review_case_id": review["case_id"] if review else None}
 
         receipt_id = _insert_receipt_row(
             cur, channel=channel, message_id=message_id, event=event,
@@ -844,11 +851,18 @@ def ingest_receipt(db: Database, channel: str, raw: bytes,
             provider_ts=provider_ts,
             raw_detail={"channel": channel, "message_id": message_id,
                         "recipient": recipient}, ts=now)
+        # 失败回执自动生成复核案件（一回执最多一案；同一消息的多条失败证据归集首案），
+        # 与状态机同一事务：自动故障转移/转人工之外，管理员始终有可处理的案件。
+        review = receipt_review.ensure_case_for_failure_receipt_tx(
+            cur, receipt=cur.execute("SELECT * FROM receipts WHERE id=?",
+                                     (receipt_id,)).fetchone(),
+            msg=msg, ts=now)
         return 200, {"result": "applied", "receipt_id": receipt_id,
                      "message_id": message_id, "event": event,
                      "disposition": outcome.get("disposition"),
                      "matched_message": msg["id"],
-                     "kept_status": outcome.get("kept")}
+                     "kept_status": outcome.get("kept"),
+                     "review_case_id": review["case_id"] if review else None}
 
 
 # ============================================================================
@@ -1035,11 +1049,15 @@ def bind_unmatched_receipt(db: Database, receipt_id: int,
                 cur, msg=msg, event=row["event"], receipt_id=receipt_id,
                 provider_ts=row["provider_ts"],
                 raw_detail={"manual_bind": True, "operator": operator}, ts=now)
+        # 失败回执此前已建案（无消息证据）：复用同一案件补全关联，绝不建第二案
+        review = receipt_review.relink_case_receipt_tx(
+            cur, receipt_id=receipt_id, msg=msg, ts=now)
         return {"result": "bound", "receipt_id": receipt_id,
                 "external_message_pk": msg["id"],
                 "send_task_id": msg["send_task_id"],
                 "delivery_id": msg["delivery_id"],
-                "disposition": outcome.get("disposition")}
+                "disposition": outcome.get("disposition"),
+                "review_case_id": review["case_id"] if review else None}
 
 
 def ignore_unmatched_receipt(db: Database, receipt_id: int,
@@ -1199,13 +1217,17 @@ def replay_receipt(db: Database, receipt_id: int, operator: str,
                     cur, msg=msg, event=row["event"], receipt_id=receipt_id,
                     provider_ts=row["provider_ts"],
                     raw_detail={"replay": True, "operator": operator}, ts=now)
+            # 失败回执此前已建案（无消息证据）：复用同一案件补全关联，绝不建第二案
+            review = receipt_review.relink_case_receipt_tx(
+                cur, receipt_id=receipt_id, msg=msg, ts=now)
             audit.record(cur, "receipt_replayed", None, None, {
                 "receipt_id": receipt_id, "operator": operator,
                 "external_message_pk": msg["id"],
                 "disposition": outcome.get("disposition")}, ts=now)
             return {"result": "replayed", "receipt_id": receipt_id,
                     "matched_message": msg["id"],
-                    "disposition": outcome.get("disposition")}
+                    "disposition": outcome.get("disposition"),
+                    "review_case_id": review["case_id"] if review else None}
 
     # 已匹配/终态：用存证原文重新应用一次——终态保护保证不回退、不二次转移
     with db.tx() as cur:
@@ -1223,6 +1245,8 @@ def replay_receipt(db: Database, receipt_id: int, operator: str,
             provider_ts=latest["provider_ts"],
             raw_detail={"replay": True, "operator": operator,
                         "previous_match": latest["matched"]}, ts=now)
+        review = receipt_review.ensure_case_for_failure_receipt_tx(
+            cur, receipt=latest, msg=msg, ts=now)
         audit.record(cur, "receipt_replayed", None, None, {
             "receipt_id": receipt_id, "operator": operator,
             "external_message_pk": msg_pk,
@@ -1232,7 +1256,8 @@ def replay_receipt(db: Database, receipt_id: int, operator: str,
         return {"result": "replayed", "receipt_id": receipt_id,
                 "matched_message": msg_pk, "changed": outcome.get("changed", False),
                 "kept_status": outcome.get("kept"),
-                "disposition": outcome.get("disposition")}
+                "disposition": outcome.get("disposition"),
+                "review_case_id": review["case_id"] if review else None}
 
 
 # ============================================================================

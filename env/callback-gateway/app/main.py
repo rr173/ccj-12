@@ -33,6 +33,7 @@ from .notif_routing import configure_routing, create_routing_router
 from .notif_templates import create_templates_router
 from .notifications import create_notifications_router
 from . import receipts
+from .receipt_review import create_review_router
 from .receipts import create_receipts_admin_router, create_receipts_public_router
 from .replay import ReplayWorker, create_replay_router
 from .replay_policy import create_policy_router
@@ -135,6 +136,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 外部通道回执：公共验签接入口 + 管理员查询/绑定/重放/策略
     app.include_router(create_receipts_public_router(db))
     app.include_router(create_receipts_admin_router(db, settings))
+    # 回执失败复核案件：bounced 等回执自动建案 + 管理员查案/证据
+    app.include_router(create_review_router(db))
     return app
 
 
