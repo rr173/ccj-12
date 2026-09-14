@@ -1077,7 +1077,7 @@ def _close_task_core(cur, task: sqlite3.Row, reason: str, now: float) -> bool:
         """UPDATE notif_send_tasks SET status='cancelled', cancelled_reason=?,
            next_retry_at=NULL, updated_at=? WHERE id=?
            AND status IN ('pending','in_flight','failed','quarantined',
-                          'awaiting_manual','awaiting_confirmation')""",
+                          'awaiting_manual','awaiting_confirmation','render_failed')""",
         (reason, now, task["id"]))
     cur.execute(
         """UPDATE notif_channel_state SET state='open', probe_task_id=NULL,

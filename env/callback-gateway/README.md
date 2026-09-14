@@ -939,6 +939,84 @@ curl -X POST .../routing/channels/webhook/state -H 'Content-Type: application/js
 （计划、每次尝试与切换）。
 
 
+## 通知内容模板编排
+
+在通知事件、通道路由、旧链路投递、外部回执与审计之上，系统提供**按事件类型 × 通道生效、
+多语言、版本化**的通知正文模板，并保证「发布后发送即固化」的可追溯性
+（`app/notif_templates.py`）。
+
+- **草稿 → 发布**：运营为 `event_type`（支持 `*` 通配）× `channel`
+  （`email`/`webhook`/`inbox`/`*`）维护草稿，声明变量（必填、默认值、`sensitive`、
+  类型 `string|int|number|bool`）、各语言标题/正文、可用语言与语言回退顺序。发布前整份
+  校验：占位符必须有声明、语言间占位符集合一致、敏感变量的每个占位符必须带 `|mask`、
+  必填变量必须被使用；失败落 `rejected` 版本记录（原因可查），当前指针不动。
+- **语言回退**：入队时按接收人语言偏好（联系人 `language`，缺省取
+  `NOTIF_DEFAULT_LANGUAGE`）选择版本，回退链 = 接收人语言 → 模板声明
+  `fallback_languages` → 系统缺省语言，命中第一门有正文的语言；链上全无以
+  `missing_language` 阻断。
+- **不能发送的情形**：变量缺失（`missing_variable`）、类型不符（`type_mismatch`）、
+  正文/标题超通道限制（`body_too_long`/`subject_too_long`，限制见
+  `NOTIF_*_MAX` 配置）、敏感变量原文出现在正文（`sensitive_unmasked`，`|mask` 保留
+  末 4 位）。失败写入 `notif_template_render_failures`，可按接收人/事件/通道/原因查询。
+- **固化**：发送任务在**入队事务内**为计划中每个通道渲染一次，模板版本、语言、回退链、
+  变量快照（敏感值只存脱敏值）、最终标题/正文/webhook 负载与正文 SHA-256 随
+  `notif_send_tasks.content_snapshot` 固化；发送器与重试只读固化正文。之后编辑/发布
+  模板、回滚都不影响已入队/已发送内容。旧链路投递落盘的同样是渲染后正文并固化版本/语言/
+  哈希。
+- **阻断终态**：版本化路由任务的全部计划通道都渲染失败时，任务落 `render_failed`
+  （worker 不自动派发、不自动重试、无任何外发）；管理员修好模板/变量后用
+  `POST .../templates/tasks/{id}/retry-render` 重新渲染回 `pending`，未解除失败记录
+  自动标记 resolved。部分通道失败时该通道从计划剔除（如 inbox 兜底仍可发送）。
+- **模板解析顺序**：精确 `(event,channel)` → `(event,'*')` → `('*',channel)` →
+  `('*','*')`；四处都没有则视为该通道未配置模板，沿用事件静态正文（存量行为完全不变）。
+
+```bash
+T=/admin/approval-notifications/templates
+# 1) 创建/编辑草稿（PUT 整体编辑；POST 带 "upsert":true 也可整体替换）
+curl -X POST localhost:8000$T/drafts -H 'Content-Type: application/json' -d '{
+  "operator":"ops-admin","event_type":"activated","channel":"email",
+  "variables":[
+    {"name":"batch_id","type":"int"},
+    {"name":"node_seq","type":"int"},
+    {"name":"submitted_by","type":"string"},
+    {"name":"token","type":"string","sensitive":true,"required":false,"default":"-"}],
+  "texts":[
+    {"language":"zh","subject":"节点激活 {submitted_by}",
+     "body":"批次 {batch_id} 节点 {node_seq} 由 {submitted_by} 提交"},
+    {"language":"en","subject":"Node active {submitted_by}",
+     "body":"Batch {batch_id} node {node_seq} by {submitted_by}"}],
+  "fallback_languages":["en"]}'
+# 发布前只校验（不改状态）/ 只读预览（不发送、不留失败）
+curl -X POST localhost:8000$T/drafts/activated/email/validate
+curl -X POST localhost:8000$T/drafts/activated/email/preview -H 'Content-Type: application/json' \
+  -d '{"language":"en","variables":{"batch_id":7,"node_seq":0,"submitted_by":"ops-li"}}'
+# 发布（校验失败 -> 422 + rejected 版本，当前指针不变；相同内容重复发布幂等 unchanged）
+curl -X POST localhost:8000$T/drafts/activated/email/publish \
+  -d '{"operator":"ops-admin","reason":"上线"}'
+
+# 2) 查询：当前指针、版本历史（draft/published/rejected）、版本详情与历史版本预览
+curl localhost:8000$T/current
+curl 'localhost:8000$T/versions?event_type=activated'
+curl localhost:8000$T/versions/12
+
+# 3) 渲染失败查询（默认只看未解除）与修复后重试渲染
+curl 'localhost:8000$T/render-failures?reason_code=missing_variable'
+curl -X POST localhost:8000$T/tasks/9/retry-render -H 'Content-Type: application/json' \
+  -d '{"operator":"ops-admin","variables":{"approval_link":"https://app/approve"}}'
+```
+
+发送任务详情（`.../routing/tasks/{id}?history` 内嵌）暴露 `render_status`、
+`content_snapshot`（每通道版本/语言/回退链/最终标题正文/变量快照/哈希）与
+`template_snapshot`；旧链路投递视图带 `template_version_id`/`template_language`/
+`content_sha256`。看板新增 `route_render_failed` 计数。
+
+审计事件：`notif_template_draft_created` / `notif_template_draft_updated` /
+`notif_template_published` / `notif_template_publish_duplicate` /
+`notif_template_publish_rejected` / `notif_send_task_render_blocked` /
+`notif_template_retry_render_succeeded` / `notif_template_retry_render_failed`；
+待办生成审计内嵌 `templated_channels`/`blocked_channels`。
+
+
 ## 外部通道回执与送达确认
 
 在通知路由、发送任务与审计链路之上，系统为 email/webhook 外发提供**外部回执接入、

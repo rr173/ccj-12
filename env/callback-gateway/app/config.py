@@ -36,6 +36,15 @@ class Settings:
     notif_breaker_failure_threshold: int = 5
     notif_breaker_cooldown_seconds: float = 30.0
     notif_channel_timeout_seconds: float = 10.0
+    # 通知内容模板：接收人缺省语言偏好（联系人未声明语言时使用）
+    notif_default_language: str = "zh"
+    # 通道正文/标题长度上限（模板渲染结果超长则拒绝发送，留可查失败原因）
+    notif_email_subject_max: int = 200
+    notif_email_body_max: int = 10000
+    notif_webhook_body_max: int = 20000
+    notif_webhook_subject_max: int = 200
+    notif_inbox_title_max: int = 200
+    notif_inbox_body_max: int = 5000
     # 外部通道回执与送达确认：发送成功后多久没有外部回执算「待确认」（缺省策略，可由
     # /admin/receipt-policy 在线调整）；失败回执（bounced/complained/expired）或超时后
     # 按当前策略自动沿通道计划重试（最多 confirm_max_retries 次）或转人工
@@ -82,6 +91,20 @@ class Settings:
                 "NOTIF_BREAKER_COOLDOWN_SECONDS", cls.notif_breaker_cooldown_seconds)),
             notif_channel_timeout_seconds=float(os.environ.get(
                 "NOTIF_CHANNEL_TIMEOUT_SECONDS", cls.notif_channel_timeout_seconds)),
+            notif_default_language=os.environ.get(
+                "NOTIF_DEFAULT_LANGUAGE", cls.notif_default_language),
+            notif_email_subject_max=int(os.environ.get(
+                "NOTIF_EMAIL_SUBJECT_MAX", cls.notif_email_subject_max)),
+            notif_email_body_max=int(os.environ.get(
+                "NOTIF_EMAIL_BODY_MAX", cls.notif_email_body_max)),
+            notif_webhook_body_max=int(os.environ.get(
+                "NOTIF_WEBHOOK_BODY_MAX", cls.notif_webhook_body_max)),
+            notif_webhook_subject_max=int(os.environ.get(
+                "NOTIF_WEBHOOK_SUBJECT_MAX", cls.notif_webhook_subject_max)),
+            notif_inbox_title_max=int(os.environ.get(
+                "NOTIF_INBOX_TITLE_MAX", cls.notif_inbox_title_max)),
+            notif_inbox_body_max=int(os.environ.get(
+                "NOTIF_INBOX_BODY_MAX", cls.notif_inbox_body_max)),
             receipt_confirm_timeout_seconds=float(os.environ.get(
                 "RECEIPT_CONFIRM_TIMEOUT_SECONDS",
                 cls.receipt_confirm_timeout_seconds)),

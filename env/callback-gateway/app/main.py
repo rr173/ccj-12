@@ -30,6 +30,7 @@ from .notif_policy import create_notif_policy_router
 from .notif_quota import create_quota_router
 from .notif_reconciliation import create_reconciliation_router
 from .notif_routing import configure_routing, create_routing_router
+from .notif_templates import create_templates_router
 from .notifications import create_notifications_router
 from . import receipts
 from .receipts import create_receipts_admin_router, create_receipts_public_router
@@ -125,6 +126,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(create_notif_policy_router(db, settings))
     app.include_router(create_routing_router(
         db, settings, lambda: notif_worker.senders))
+    # 通知内容模板编排：版本化草稿/发布/预览、语言回退、入队渲染固化、渲染失败可查可重试
+    app.include_router(create_templates_router(db, settings))
     # 接收人通知额度与抑制窗口：版本化配置、原子预占、超额延迟/降级/转人工
     app.include_router(create_quota_router(db, settings))
     # 通知状态对账与补偿：只读快照、分页/暂停/恢复/重启续跑、幂等人工补偿

@@ -70,6 +70,13 @@ TASK_QUARANTINED = "quarantined"
 TASK_CANCELLED = "cancelled"
 # 回执失败转人工 / 额度超额转人工（receipts / notif_quota 设置）
 TASK_AWAITING_MANUAL = "awaiting_manual"
+# 内容模板渲染失败（变量缺失/类型不符/无语言版本/超长/敏感未脱敏）：终态，worker 不
+# 自动派发，管理员修复模板/变量后经 retry-render 重新渲染回 pending
+TASK_RENDER_FAILED = "render_failed"
+
+# 任务终态（不会再被 worker 派发；取消/渲染失败隔离在列）
+TASK_TERMINAL_STATES = (TASK_SENT, TASK_QUARANTINED, TASK_CANCELLED,
+                        TASK_RENDER_FAILED)
 
 BREAKER_CLOSED = "closed"
 BREAKER_OPEN = "open"
@@ -87,6 +94,8 @@ SW_BREAKER_OPEN = "breaker_open"
 SW_CHANNEL_DISABLED = "channel_disabled"
 SW_NO_ADDRESS = "no_address"
 SW_PLAN_EXHAUSTED = "plan_exhausted"
+# 模板渲染失败（变量缺失/类型不符/无语言版本/超长/敏感未脱敏），通道从计划剔除
+SW_TEMPLATE_RENDER_FAILED = "template_render_failed"
 
 # 无路由版本/无匹配规则时的内置兜底计划：邮件 -> webhook -> 站内（发布了路由但该事件
 # 类型未配置时使用，保证路由开启后仍 fail-safe，站内待办始终兜底）
@@ -529,9 +538,15 @@ def enqueue_for_todo_tx(cur: sqlite3.Cursor, todo, event, settings: Settings,
          if qsnap else None,
          now, now))
     task_id = cur.lastrowid
-    # 解析每通道地址；外发通道无可用地址则跳过（记切换原因 no_address，不占尝试次数）
+    # 内容模板：按计划中的每个具体通道在入队事务内渲染一次（语言回退、变量/类型/长度/
+    # 敏感校验都在此刻完成），渲染结果固化进计划项与 content_snapshot；之后模板编辑、
+    # 新版本发布都不影响本任务。渲染失败的通道从计划剔除并落 notif_template_render_failures。
+    from . import notif_templates
     payload = json.loads(event["payload"] or "{}")
     plan: list[dict] = []
+    content_snapshot: dict = {}
+    template_meta = None
+    render_failures: list[dict] = []
     for spec in specs:
         ch = spec["channel"]
         address = None
@@ -551,12 +566,82 @@ def enqueue_for_todo_tx(cur: sqlite3.Cursor, todo, event, settings: Settings,
                                   None, ch, SW_NO_ADDRESS,
                                   {"note": "contact has no webhook url"}, now)
                 continue
-        plan.append({"channel": ch, "address": address,
-                     "timeout_seconds": spec["timeout_seconds"],
-                     "max_attempts": spec["max_attempts"],
-                     "condition": spec.get("condition")})
+        # 该通道已可用：解析模板并渲染
+        try:
+            tres = notif_templates.render_for_channel_tx(
+                cur, event_type=event["event_type"], channel=ch,
+                recipient=todo["recipient"], supplied=payload, settings=settings)
+        except notif_templates.TemplateError as exc:
+            fid = notif_templates.record_failure_tx(
+                cur, entity_type="task", channel=ch, todo_id=todo["id"],
+                event_id=event["id"], recipient=todo["recipient"],
+                event_type=event["event_type"], exc=exc, send_task_id=task_id,
+                now=now)
+            render_failures.append({"channel": ch, "failure_id": fid,
+                                    "code": exc.code, "message": exc.message})
+            _record_switch_tx(cur, task_id, event["id"], todo["recipient"],
+                              None, ch, SW_TEMPLATE_RENDER_FAILED,
+                              {"code": exc.code, "message": exc.message,
+                               "failure_id": fid}, now)
+            continue
+        if not tres["templated"]:
+            # 未配置模板：沿用事件静态正文（行为与引入模板前完全一致）
+            rsubject, rbody = event["subject"], event["body"]
+            rlang, lang_chain, version_id, var_snapshot = None, [], None, {}
+            channel_payload = payload
+        else:
+            rendered = tres["rendered"]
+            rsubject, rbody = rendered["subject"], rendered["body"]
+            rlang, lang_chain = rendered["language"], rendered["language_chain"]
+            version_id = tres["template_version_id"]
+            var_snapshot = rendered["variables_snapshot"]
+            template_meta = {
+                "template_version_id": version_id,
+                "variables": tres["template"]["variables"],
+                "languages": tres["template"]["languages"],
+                "fallback_languages": tres["template"]["fallback_languages"]}
+            channel_payload = {**payload, "subject": rsubject, "body": rbody}
+        sha = notif_templates.content_hash(
+            channel=ch, subject=rsubject, body=rbody)
+        item = {"channel": ch, "address": address,
+                "timeout_seconds": spec["timeout_seconds"],
+                "max_attempts": spec["max_attempts"],
+                "condition": spec.get("condition"),
+                # 固化的最终内容：发送器与重试都只读这里，不重新渲染
+                "subject": rsubject, "body": rbody,
+                "template_version_id": version_id, "language": rlang,
+                "language_chain": lang_chain, "content_sha256": sha}
+        if ch == CHANNEL_WEBHOOK:
+            item["webhook_payload"] = channel_payload
+        plan.append(item)
+        content_snapshot[ch] = {
+            "template_version_id": version_id, "language": rlang,
+            "language_chain": lang_chain, "subject": rsubject, "body": rbody,
+            "variables_snapshot": var_snapshot, "content_sha256": sha}
     if not plan:
-        # 没有任何可路由通道：任务取消（区别于从未入队），全程留痕
+        if render_failures:
+            # 全部通道因模板渲染失败被剔除：终态 render_failed（不派发、不自动重试、
+            # 不发任何外部消息），失败原因逐通道可查，修复后可手动 retry-render。
+            cur.execute(
+                """UPDATE notif_send_tasks SET status='render_failed',
+                   plan_json='[]', render_status='failed',
+                   render_failure_reason=?, template_snapshot=?, content_snapshot=?,
+                   current_channel=NULL, updated_at=? WHERE id=?""",
+                (json.dumps(render_failures, ensure_ascii=False),
+                 json.dumps(template_meta, ensure_ascii=False, sort_keys=True),
+                 json.dumps(content_snapshot, ensure_ascii=False, sort_keys=True),
+                 now, task_id))
+            audit.record(cur, "notif_send_task_render_blocked", None, None, {
+                "send_task_id": task_id, "todo_id": todo["id"],
+                "notify_event_id": event["id"], "event_type": event["event_type"],
+                "source_type": todo["source_type"],
+                "source_batch_id": todo["batch_id"], "change_id": todo["change_id"],
+                "node_id": todo["node_id"], "recipient": todo["recipient"],
+                "route_version": version, "failures": render_failures}, ts=now)
+            return {"routed": True, "task_id": task_id, "plan": [],
+                    "skipped_reason": "template_render_failed",
+                    "render_failures": render_failures}
+        # 没有任何可路由通道（无地址）：任务取消（区别于从未入队），全程留痕
         cur.execute(
             "UPDATE notif_send_tasks SET status='cancelled', plan_json='[]', "
             "cancelled_reason='no_routable_channel', updated_at=? WHERE id=?",
@@ -571,13 +656,20 @@ def enqueue_for_todo_tx(cur: sqlite3.Cursor, todo, event, settings: Settings,
             "reason": "no_routable_channel"}, ts=now)
         return {"routed": True, "task_id": task_id, "plan": [],
                 "skipped_reason": "no_routable_channel"}
-    cur.execute("UPDATE notif_send_tasks SET plan_json=? WHERE id=?",
-                (json.dumps([{**p, "webhook_payload": payload} for p in plan],
-                            ensure_ascii=False, sort_keys=True), task_id))
+    cur.execute(
+        """UPDATE notif_send_tasks
+           SET plan_json=?, content_snapshot=?, template_snapshot=?,
+               render_status=?, updated_at=? WHERE id=?""",
+        (json.dumps(plan, ensure_ascii=False, sort_keys=True),
+         json.dumps(content_snapshot, ensure_ascii=False, sort_keys=True),
+         json.dumps(template_meta, ensure_ascii=False, sort_keys=True),
+         "rendered" if template_meta is not None else "not_templated",
+         now, task_id))
     _record_switch_tx(cur, task_id, event["id"], todo["recipient"], None,
                       plan[0]["channel"], SW_SELECTED,
                       {"route_version": version,
-                       "plan": [p["channel"] for p in plan]}, now)
+                       "plan": [p["channel"] for p in plan],
+                       "languages": {p["channel"]: p["language"] for p in plan}}, now)
     audit.record(cur, "notif_send_task_enqueued", None, None, {
         "send_task_id": task_id, "todo_id": todo["id"],
         "notify_event_id": event["id"], "event_type": event["event_type"],
@@ -585,9 +677,14 @@ def enqueue_for_todo_tx(cur: sqlite3.Cursor, todo, event, settings: Settings,
         "source_batch_id": todo["batch_id"], "change_id": todo["change_id"],
         "node_id": todo["node_id"], "recipient": todo["recipient"],
         "route_version": version,
-        "plan": [p["channel"] for p in plan]}, ts=now)
+        "plan": [p["channel"] for p in plan],
+        "languages": {p["channel"]: p["language"] for p in plan},
+        "templated_channels": [p["channel"] for p in plan
+                               if p["template_version_id"] is not None],
+        "render_failures": render_failures}, ts=now)
     return {"routed": True, "task_id": task_id,
-            "plan": [p["channel"] for p in plan], "skipped_reason": None}
+            "plan": [p["channel"] for p in plan], "skipped_reason": None,
+            "render_failures": render_failures}
 
 
 # ============================================================================
@@ -609,7 +706,7 @@ def cancel_task_tx(cur: sqlite3.Cursor, task_id: int, reason: str,
         """UPDATE notif_send_tasks SET status='cancelled', cancelled_reason=?,
            next_retry_at=NULL, updated_at=? WHERE id=?
            AND status IN ('pending','in_flight','failed','awaiting_manual',
-                          'awaiting_confirmation')""",
+                          'awaiting_confirmation','render_failed')""",
         (reason, now, task_id))
     # 若它占用了某通道的恢复探针，释放探针归属（通道回到 open，下轮重新探针）
     cur.execute(
@@ -633,7 +730,7 @@ def cancel_tasks_for_todo_tx(cur: sqlite3.Cursor, todo_id: int, reason: str,
     rows = cur.execute(
         "SELECT id FROM notif_send_tasks WHERE todo_id=? "
         "AND status IN ('pending','in_flight','failed','awaiting_manual',"
-        "'awaiting_confirmation')", (todo_id,)).fetchall()
+        "'awaiting_confirmation','render_failed')", (todo_id,)).fetchall()
     n = 0
     for r in rows:
         if cancel_task_tx(cur, r["id"], reason, now):
@@ -797,7 +894,10 @@ def _call_sender(task: sqlite3.Row, plan_item: dict, channel: str,
         if sender is None:
             return ATTEMPT_FAILURE, f"no sender configured for channel {channel!r}", 0.0, None
         if channel == CHANNEL_EMAIL:
-            fn, args = sender, (plan_item["address"], task["subject"], task["body"])
+            # 用入队时固化在计划项里的模板渲染正文（不重新渲染，模板后续编辑不影响本任务）
+            fn, args = sender, (plan_item["address"],
+                                plan_item.get("subject", task["subject"]),
+                                plan_item.get("body", task["body"]))
         else:
             fn, args = sender, (plan_item["address"],
                                plan_item.get("webhook_payload") or {})
@@ -840,11 +940,14 @@ def _record_switch_tx(cur, task_id: int | None, event_id: int, recipient: str,
     return cur.lastrowid
 
 
-def _mark_sent(cur, task, channel: str, now: float) -> None:
+def _mark_sent(cur, task, channel: str, now: float, plan_item: dict | None = None) -> None:
+    # content_sha256 取入队时固化在计划项里的正文指纹（未配置模板时为 NULL）
+    content_sha = (plan_item or {}).get("content_sha256")
     cur.execute(
         """UPDATE notif_send_tasks SET status='sent', sent_channel=?, sent_at=?,
-           current_channel=?, next_retry_at=NULL, last_error=NULL, updated_at=?
-           WHERE id=?""", (channel, now, channel, now, task["id"]))
+           current_channel=?, content_sha256=COALESCE(?, content_sha256),
+           next_retry_at=NULL, last_error=NULL, updated_at=?
+           WHERE id=?""", (channel, now, channel, content_sha, now, task["id"]))
 
 
 def _quarantine(cur, task, now: float, error: str) -> None:
@@ -950,7 +1053,7 @@ def process_send_task(db: Database, task_id: int, senders: dict, settings: Setti
             _advance_breaker_on_result(cur, state, result, is_probe=is_probe,
                                        task_id=task_id, now=now)
             if result == ATTEMPT_SUCCESS:
-                _mark_sent(cur, task, ch, now)
+                _mark_sent(cur, task, ch, now, item)
                 # 预占转 consumed（含降级预占）：本事件的额度在窗口内真正用掉，
                 # 后续重试/回执通道切换复用同一预占、不再重复占用。
                 from . import notif_quota
@@ -1281,6 +1384,12 @@ def _task_view(db: Database, row: sqlite3.Row, *, with_history: bool = False) ->
         "quota_reason": row["quota_reason"],
         "quota_generation": row["quota_generation"],
         "quota_snapshot": None,
+        "render_status": row["render_status"],
+        "render_failure_reason": (json.loads(row["render_failure_reason"])
+                                  if row["render_failure_reason"] else None),
+        "template_snapshot": None,
+        "content_snapshot": None,
+        "content_sha256": row["content_sha256"],
         "created_at": row["created_at"], "updated_at": row["updated_at"]}
     if with_history:
         item["attempts"] = _attempts_view(db, row["id"])
@@ -1288,6 +1397,10 @@ def _task_view(db: Database, row: sqlite3.Row, *, with_history: bool = False) ->
         item["route_snapshot"] = json.loads(row["route_snapshot"])
         if row["quota_snapshot"]:
             item["quota_snapshot"] = json.loads(row["quota_snapshot"])
+        if row["template_snapshot"]:
+            item["template_snapshot"] = json.loads(row["template_snapshot"])
+        if row["content_snapshot"]:
+            item["content_snapshot"] = json.loads(row["content_snapshot"])
     return item
 
 

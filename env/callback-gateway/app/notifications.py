@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 
@@ -93,6 +94,7 @@ class ContactUpsertRequest(BaseModel):
     email: str | None = None
     webhook_url: str | None = None
     channels: list[str] = []            # 启用的外发通道；站内待办始终生成
+    language: str | None = None         # 语言偏好（如 zh/en）；缺省取系统 NOTIF_DEFAULT_LANGUAGE
     operator: str
 
 
@@ -185,22 +187,33 @@ def _change_recipients(cur: sqlite3.Cursor, change_id: int,
 
 
 def _insert_deliveries(cur: sqlite3.Cursor, todo_id: int, recipient: str,
-                       subject: str, body: str, payload: dict, now: float) -> dict:
+                       subject: str, body: str, payload: dict, now: float,
+                       rendered: dict | None = None) -> dict:
     """按联系人启用通道生成邮件/webhook 投递行（无通道则 0 条）。
 
     聚合规则命中时投递落 held 并入组（窗口关闭后由摘要替代）；否则静默时段命中时
     落 delayed（时段结束按 ordinal 原事件顺序放行）；都不命中才是立即可发的 pending。
     路由逻辑集中在 notif_policy（本模块在函数内惰性导入，避免循环依赖）。
-    返回 {"created": n, "held": n, "delayed": n, "immediate": n}。
+
+    rendered：模板编排按通道预渲染的内容
+      {channel: {"templated", "template_version_id", "rendered"}}（由
+      notif_templates.render_event_channels_tx 产出）。渲染失败的通道不生成投递，
+      失败已落 notif_template_render_failures（可查询）；None/缺省表示未配置模板，
+      沿用事件静态 subject/body/payload（存量行为）。
+    返回 {"created": n, "held": n, "delayed": n, "immediate": n,
+          "templated_channels": [...], "blocked_channels": [...]}。
     """
     from . import notif_policy
+    from . import notif_templates
     contact = cur.execute(
         "SELECT * FROM approval_contacts WHERE name=? AND active=1",
         (recipient,)).fetchone()
     if contact is None:
-        return {"created": 0, "held": 0, "delayed": 0, "immediate": 0}
+        return {"created": 0, "held": 0, "delayed": 0, "immediate": 0,
+                "templated_channels": [], "blocked_channels": []}
     channels = json.loads(contact["channels"])
-    counts = {"created": 0, "held": 0, "delayed": 0, "immediate": 0}
+    counts = {"created": 0, "held": 0, "delayed": 0, "immediate": 0,
+              "templated_channels": [], "blocked_channels": []}
     for channel in channels:
         if channel == CHANNEL_EMAIL:
             address = contact["email"]
@@ -214,6 +227,29 @@ def _insert_deliveries(cur: sqlite3.Cursor, todo_id: int, recipient: str,
             cpayload = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
         else:
             continue
+        csubject, cbody = subject, body
+        template_version_id, template_language, content_sha = None, None, None
+        rentry = (rendered or {}).get(channel)
+        if rentry is not None:
+            outcome = rentry["outcome"]
+            if outcome == "failed":
+                # 模板渲染失败：不生成投递（失败原因已落 notif_template_render_failures）
+                counts["blocked_channels"].append(
+                    {"channel": channel, "code": rentry["code"],
+                     "message": rentry["message"]})
+                continue
+            if outcome == "rendered":
+                rd = rentry["rendered"]
+                csubject, cbody = rd["subject"], rd["body"]
+                template_version_id = rentry["template_version_id"]
+                template_language = rd["language"]
+                content_sha = notif_templates.content_hash(
+                    channel=channel, subject=csubject, body=cbody)
+                counts["templated_channels"].append(channel)
+                if channel == CHANNEL_WEBHOOK:
+                    cpayload = json.dumps(
+                        {**(payload or {}), "subject": csubject, "body": cbody},
+                        ensure_ascii=False, sort_keys=True)
         todo = cur.execute("SELECT * FROM approval_todos WHERE id=?",
                            (todo_id,)).fetchone()
         # 1) 聚合：命中规则 -> held 入组（窗口关闭合并为一条摘要）
@@ -223,10 +259,12 @@ def _insert_deliveries(cur: sqlite3.Cursor, todo_id: int, recipient: str,
             cur.execute(
                 """INSERT INTO approval_notification_deliveries
                    (todo_id, recipient, channel, address, subject, body, payload,
-                    status, next_retry_at, group_id, ordinal, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?, 'held', NULL, ?, ?, ?, ?)""",
-                (todo_id, recipient, channel, address, subject, body, cpayload,
-                 group["id"], todo_id, now, now))
+                    status, next_retry_at, group_id, ordinal, created_at, updated_at,
+                    template_version_id, template_language, content_sha256)
+                   VALUES (?,?,?,?,?,?,?, 'held', NULL, ?, ?, ?, ?, ?, ?, ?)""",
+                (todo_id, recipient, channel, address, csubject, cbody, cpayload,
+                 group["id"], todo_id, now, now,
+                 template_version_id, template_language, content_sha))
             delivery_id = cur.lastrowid
             cur.execute(
                 """INSERT OR IGNORE INTO approval_notification_group_members
@@ -247,10 +285,12 @@ def _insert_deliveries(cur: sqlite3.Cursor, todo_id: int, recipient: str,
             cur.execute(
                 """INSERT INTO approval_notification_deliveries
                    (todo_id, recipient, channel, address, subject, body, payload,
-                    status, next_retry_at, delayed_until, ordinal, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?, 'delayed', NULL, ?, ?, ?, ?)""",
-                (todo_id, recipient, channel, address, subject, body, cpayload,
-                 resume_at, todo_id, now, now))
+                    status, next_retry_at, delayed_until, ordinal, created_at, updated_at,
+                    template_version_id, template_language, content_sha256)
+                   VALUES (?,?,?,?,?,?,?, 'delayed', NULL, ?, ?, ?, ?, ?, ?, ?)""",
+                (todo_id, recipient, channel, address, csubject, cbody, cpayload,
+                 resume_at, todo_id, now, now,
+                 template_version_id, template_language, content_sha))
             notif_policy.audit_delayed(cur, delivery_id=cur.lastrowid, todo=todo,
                                        recipient=recipient, channel=channel,
                                        resume_at=resume_at, now=now)
@@ -261,10 +301,11 @@ def _insert_deliveries(cur: sqlite3.Cursor, todo_id: int, recipient: str,
         cur.execute(
             """INSERT INTO approval_notification_deliveries
                (todo_id, recipient, channel, address, subject, body, payload,
-                status, next_retry_at, ordinal, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?,?)""",
-            (todo_id, recipient, channel, address, subject, body, cpayload,
-             todo_id, now, now))
+                status, next_retry_at, ordinal, created_at, updated_at,
+                template_version_id, template_language, content_sha256)
+               VALUES (?,?,?,?,?,?,?,'pending',NULL,?,?,?, ?,?,?)""",
+            (todo_id, recipient, channel, address, csubject, cbody, cpayload,
+             todo_id, now, now, template_version_id, template_language, content_sha))
         counts["created"] += 1
         counts["immediate"] += 1
     return counts
@@ -314,9 +355,25 @@ def _create_todos(cur: sqlite3.Cursor, event_row: sqlite3.Row,
                 "route_skipped_reason": routed["skipped_reason"]}, ts=now)
             created += 1
             continue
+        # 旧链路：入队前按联系人启用通道逐个渲染模板（未配置模板的通道沿用静态正文；
+        # 渲染失败的通道不生成投递，原因落 notif_template_render_failures）。
+        rendered = None
+        contact_row = cur.execute(
+            "SELECT channels FROM approval_contacts WHERE name=? AND active=1",
+            (recipient,)).fetchone()
+        if contact_row is not None:
+            from . import notif_templates
+            contact_channels = json.loads(contact_row["channels"])
+            payload = json.loads(event_row["payload"] or "{}")
+            rendered = notif_templates.render_event_channels_tx(
+                cur, event_type=event_row["event_type"], recipient=recipient,
+                channels=[c for c in contact_channels
+                          if c in (CHANNEL_EMAIL, CHANNEL_WEBHOOK)],
+                supplied=payload, settings=notif_routing._settings_at(cur), now=now,
+                entity_type="delivery", todo_id=todo_id, event_id=event_row["id"])
         routing = _insert_deliveries(
             cur, todo_id, recipient, event_row["subject"], event_row["body"],
-            json.loads(event_row["payload"]), now)
+            json.loads(event_row["payload"]), now, rendered=rendered)
         audit.record(cur, "approval_todo_generated", None, None, {
             "todo_id": todo_id, "notify_event_id": event_row["id"],
             "event_type": event_row["event_type"],
@@ -327,7 +384,14 @@ def _create_todos(cur: sqlite3.Cursor, event_row: sqlite3.Row,
             "actionable": bool(event_row["actionable"]),
             "deliveries_created": routing["created"],
             "deliveries_held": routing["held"],
-            "deliveries_delayed": routing["delayed"]}, ts=now)
+            "deliveries_delayed": routing["delayed"],
+            "templated_channels": routing["templated_channels"],
+            "blocked_channels": routing["blocked_channels"]}, ts=now)
+        if routing["blocked_channels"]:
+            audit.record(cur, "notif_template_render_blocked", None, None, {
+                "todo_id": todo_id, "notify_event_id": event_row["id"],
+                "event_type": event_row["event_type"], "recipient": recipient,
+                "blocked_channels": routing["blocked_channels"]}, ts=now)
         created += 1
     return created
 
@@ -895,7 +959,10 @@ def _todo_view(cur: sqlite3.Cursor, todo, now: float) -> dict:
                         "last_error": d["last_error"], "sent_at": d["sent_at"],
                         "group_id": d["group_id"],
                         "delayed_until": d["delayed_until"],
-                        "ordinal": d["ordinal"]}
+                        "ordinal": d["ordinal"],
+                        "template_version_id": d["template_version_id"],
+                        "template_language": d["template_language"],
+                        "content_sha256": d["content_sha256"]}
                        for d in deliveries],
         "failed_channels": failed, "quarantined_channels": quarantined,
         "held_channels": held, "delayed_channels": delayed,
@@ -929,6 +996,10 @@ def _route_task_view(cur: sqlite3.Cursor, todo_id: int) -> dict | None:
         "total_attempts": task["total_attempts"], "round": task["round"],
         "next_retry_at": task["next_retry_at"], "last_error": task["last_error"],
         "cancelled_reason": task["cancelled_reason"],
+        "render_status": task["render_status"],
+        "render_failure_reason": (json.loads(task["render_failure_reason"])
+                                  if task["render_failure_reason"] else None),
+        "content_sha256": task["content_sha256"],
         "attempts": [{"channel": a["channel"], "result": a["result"],
                       "probe": bool(a["probe"]), "duration": a["duration"],
                       "error": a["error"], "created_at": a["created_at"]}
@@ -1078,12 +1149,13 @@ def todo_summary(db: Database, recipient: str | None = None) -> dict:
         "delivery_aggregated": delivery_counts.get(DELIVERY_AGGREGATED, 0),
         "delivery_delayed": delivery_counts.get(DELIVERY_DELAYED, 0),
         "delivery_sent": delivery_counts.get(DELIVERY_SENT, 0),
-        # 版本化路由链路（发布过路由版本后才有）：待发/在途/已发/隔离/取消
+        # 版本化路由链路（发布过路由版本后才有）：待发/在途/已发/隔离/取消/渲染阻断
         "route_pending": route_counts.get("pending", 0),
         "route_in_flight": route_counts.get("in_flight", 0),
         "route_sent": route_counts.get("sent", 0),
         "route_quarantined": route_counts.get("quarantined", 0),
         "route_cancelled": route_counts.get("cancelled", 0),
+        "route_render_failed": route_counts.get("render_failed", 0),
     }
 
 
@@ -1091,7 +1163,9 @@ def todo_summary(db: Database, recipient: str | None = None) -> dict:
 
 def _contact_view(row) -> dict:
     return {"name": row["name"], "email": row["email"], "webhook_url": row["webhook_url"],
-            "channels": json.loads(row["channels"]), "active": bool(row["active"]),
+            "channels": json.loads(row["channels"]),
+            "language": row["language"] if "language" in row.keys() else None,
+            "active": bool(row["active"]),
             "created_by": row["created_by"], "created_at": row["created_at"],
             "updated_at": row["updated_at"], "deactivated_at": row["deactivated_at"],
             "deactivated_by": row["deactivated_by"]}
@@ -1153,6 +1227,10 @@ def upsert_contact(db: Database, req: ContactUpsertRequest) -> dict:
                                  f"(support {','.join(SUPPORTED_CHANNELS)})")
     email = (req.email or "").strip() or None
     webhook = (req.webhook_url or "").strip() or None
+    language = (req.language or "").strip() or None
+    if language is not None and not re.fullmatch(r"[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)*",
+                                                 language):
+        raise HTTPException(422, f"invalid language code {language!r} (e.g. zh, en-US)")
     if CHANNEL_EMAIL in channels and not email:
         raise HTTPException(422, "email is required when the email channel is enabled")
     if CHANNEL_WEBHOOK in channels and not webhook:
@@ -1165,22 +1243,24 @@ def upsert_contact(db: Database, req: ContactUpsertRequest) -> dict:
         if existing is None:
             cur.execute(
                 """INSERT INTO approval_contacts
-                   (name, email, webhook_url, channels, active, created_by,
+                   (name, email, webhook_url, channels, language, active, created_by,
                     created_at, updated_at)
-                   VALUES (?,?,?,?,'1',?,?,?)""",
-                (name, email, webhook, json.dumps(channels), req.operator, now, now))
+                   VALUES (?,?,?,?,?, '1', ?,?,?)""",
+                (name, email, webhook, json.dumps(channels), language,
+                 req.operator, now, now))
             audit.record(cur, "approval_contact_upserted", None, None,
                          {"name": name, "operator": req.operator,
-                          "channels": channels, "reactivated": False}, ts=now)
+                          "channels": channels, "language": language,
+                          "reactivated": False}, ts=now)
         else:
             cur.execute(
                 """UPDATE approval_contacts SET email=?, webhook_url=?, channels=?,
-                   active='1', deactivated_at=NULL, deactivated_by=NULL, updated_at=?
-                   WHERE name=?""",
-                (email, webhook, json.dumps(channels), now, name))
+                   language=?, active='1', deactivated_at=NULL, deactivated_by=NULL,
+                   updated_at=? WHERE name=?""",
+                (email, webhook, json.dumps(channels), language, now, name))
             audit.record(cur, "approval_contact_upserted", None, None,
                          {"name": name, "operator": req.operator,
-                          "channels": channels,
+                          "channels": channels, "language": language,
                           "reactivated": not existing["active"]}, ts=now)
         # 为仍可操作的历史审批事件补发站内待办与投递
         backfilled = _backfill_for_contact(cur, name, now)

@@ -94,6 +94,13 @@
 - notif_reconciliation_compensations / notif_compensation_send_plans  对账补偿：重新关联
                     回执、释放孤儿预占、关闭不再发送任务、创建补偿发送计划；所有补偿幂等，
                     补偿前/后状态与依据随操作留痕，不改写原始回执和历史审计
+- notif_template_versions / notif_template_current  通知内容模板版本（按事件类型×通道，
+                    支持 '*' 通配，多语言）：草稿可反复编辑，发布为不可变版本并推进当前
+                    指针；发布校验失败落 rejected。变量声明必填/默认值/敏感/类型，占位符
+                    与声明一致、敏感变量必须 |mask
+- notif_template_render_failures  模板渲染失败记录（变量缺失/类型不符/无语言版本/超长/
+                    敏感未脱敏）：阻塞期间不产生任何外发效果，按发送任务×通道或旧链路
+                    投递幂等（未解除唯一），修复后重试渲染成功自动标记 resolved
 """
 from __future__ import annotations
 
@@ -419,6 +426,7 @@ CREATE TABLE IF NOT EXISTS approval_contacts (
     email       TEXT,                      -- 邮件通道地址（channels 含 email 时必填）
     webhook_url TEXT,                      -- webhook 通道地址（channels 含 webhook 时必填）
     channels    TEXT NOT NULL DEFAULT '[]', -- 启用的外发通道 JSON：子集 ["email","webhook"]；站内待办不受此限
+    language    TEXT,                        -- 语言偏好（如 zh/en）；NULL=取系统缺省 NOTIF_DEFAULT_LANGUAGE
     active      INTEGER NOT NULL DEFAULT 1,-- 1 接收新通知；停用后不再生成待办，未处理待办关闭
     created_by  TEXT,
     created_at  REAL NOT NULL,
@@ -512,6 +520,9 @@ CREATE TABLE IF NOT EXISTS approval_notification_deliveries (
     ordinal       INTEGER NOT NULL DEFAULT 0,
     receipt_status TEXT,                         -- 外部回执状态（旧链路登记 message_id 后跟踪）
     external_message_id INTEGER REFERENCES external_messages(id),
+    template_version_id INTEGER,                -- 入队渲染时采用的模板版本（NULL=静态正文/未配置）
+    template_language TEXT,                      -- 实际采用语言
+    content_sha256 TEXT,                         -- 最终正文指纹
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL
 );
@@ -750,6 +761,15 @@ CREATE TABLE IF NOT EXISTS notif_send_tasks (
     quota_reason TEXT,                        -- 超额处置/延迟/回收原因
     quota_generation INTEGER NOT NULL DEFAULT 1,  -- 预占代：人工 requeue/重试 +1（重新预占），
                                                   -- 失败重试/回执驱动通道切换不变（复用预占）
+    -- 内容模板固化：入队时按接收人语言渲染，之后模板编辑/发布不影响本任务。
+    -- template_*_id 为 NULL 表示该键未配置模板（沿用事件静态正文，行为与无模板时一致）。
+    -- content_snapshot 存每通道最终采用的 {版本/语言/语言回退链/标题/正文/webhook负载/哈希}。
+    template_snapshot TEXT,                -- 解析到的模板定义快照（版本/变量声明/可用语言/回退）
+    content_snapshot   TEXT,               -- 每通道渲染结果快照 JSON
+    content_sha256     TEXT,               -- 实际发送通道的正文指纹（发送后回填，轨迹锚点）
+    render_status      TEXT NOT NULL DEFAULT 'not_templated',
+        -- not_templated（未配置模板）|rendered|failed（渲染失败，不派发）
+    render_failure_reason TEXT,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     UNIQUE (event_id, recipient)
@@ -1096,6 +1116,89 @@ CREATE INDEX IF NOT EXISTS idx_notif_comp_plan_status
     ON notif_compensation_send_plans(status, scheduled_at);
 CREATE INDEX IF NOT EXISTS idx_notif_comp_plan_task
     ON notif_compensation_send_plans(task_id, status);
+
+-- 通知内容模板版本（按「事件类型 × 通道」编排；'*' 表示通配事件类型/通配通道）。
+-- 生命周期：draft（每个 event_type+channel 至多一份草稿）-> published（不可变，version
+-- 在该键内单调递增）/ rejected（发布校验失败留痕，原始提交与原因保留，不推进当前指针）。
+-- subjects_json/bodies_json 为 {语言: 文本}；variables_json 为变量声明
+-- （必填/默认值/敏感/类型）；fallback_languages_json 为该模板声明的语言回退顺序；
+-- content_sha256 为发布时规范化内容的指纹（重复发布识别）。
+CREATE TABLE IF NOT EXISTS notif_template_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type  TEXT NOT NULL,             -- 审批通知事件类型；'*'=通配
+    channel     TEXT NOT NULL,             -- email|webhook|inbox；'*'=通配通道
+    version     INTEGER,                   -- published 的版本号（键内单调递增）；draft/rejected 为 NULL
+    status      TEXT NOT NULL,             -- draft|published|rejected
+    variables_json TEXT NOT NULL DEFAULT '[]',
+    subjects_json TEXT NOT NULL,           -- {lang: subject}；inbox 用作标题
+    bodies_json TEXT NOT NULL,             -- {lang: body}
+    languages_json TEXT NOT NULL,          -- 模板提供的可用语言列表 JSON
+    fallback_languages_json TEXT NOT NULL DEFAULT '[]',
+    content_sha256 TEXT,                   -- 规范化定义的指纹（发布时计算）
+    operator    TEXT NOT NULL,
+    note        TEXT,
+    rejection_reason TEXT,                 -- rejected 的校验失败原因（JSON）
+    created_at  REAL NOT NULL,
+    published_at REAL
+);
+-- 每个「事件类型×通道」至多一份草稿（并发创建/编辑由部分唯一索引兜底）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notif_template_draft
+    ON notif_template_versions(event_type, channel) WHERE status='draft';
+CREATE INDEX IF NOT EXISTS idx_notif_template_versions_key
+    ON notif_template_versions(event_type, channel, status, version);
+
+-- 当前生效模板指针：每个「事件类型×通道」一行，指向最近 published 版本。
+-- 发送/入队时在此解析（通配 '*' 按 event_type+channel -> event_type+* ->
+-- *+channel -> *+* 顺序回退）；指针推进不影响已入队任务（它们持有自己的正文快照）。
+CREATE TABLE IF NOT EXISTS notif_template_current (
+    event_type  TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    template_version_id INTEGER NOT NULL REFERENCES notif_template_versions(id),
+    version     INTEGER NOT NULL,
+    updated_by  TEXT NOT NULL,
+    updated_at  REAL NOT NULL,
+    reason      TEXT,
+    PRIMARY KEY (event_type, channel)
+);
+
+-- 模板渲染失败记录（可查询的失败原因）：变量缺失/类型不符/无语言版本/正文超限/
+-- 敏感变量未脱敏。阻塞期间不产生任何外发效果；人工修复模板或变量后可重试渲染，
+-- resolved_at 非空表示已解除（解除时保留记录与原因，不删除）。
+CREATE TABLE IF NOT EXISTS notif_template_render_failures (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,             -- task（版本化路由发送任务）| delivery（旧链路投递）
+    send_task_id INTEGER REFERENCES notif_send_tasks(id),
+    delivery_id INTEGER REFERENCES approval_notification_deliveries(id),
+    todo_id     INTEGER,
+    event_id    INTEGER NOT NULL,
+    recipient   TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    template_version_id INTEGER REFERENCES notif_template_versions(id),
+    language    TEXT,                      -- 实际采用语言；无语言版本时为 NULL
+    language_chain_json TEXT NOT NULL DEFAULT '[]',  -- 解析时尝试的语言回退链
+    reason_code TEXT NOT NULL,             -- missing_template|missing_language|missing_variable|
+                                           -- type_mismatch|body_too_long|subject_too_long|
+                                           -- sensitive_unmasked|render_error
+    reason_detail TEXT NOT NULL,
+    variables_snapshot_json TEXT NOT NULL DEFAULT '{}',  -- 解析时变量（敏感值脱敏）快照
+    resolved_by TEXT,
+    resolved_at REAL,
+    resolve_note TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+-- 同一发送任务同一通道、同一旧链路投递，阻塞期间至多一条未解除失败（重复渲染不产生第二份）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notif_render_fail_task_open
+    ON notif_template_render_failures(send_task_id, channel)
+    WHERE resolved_at IS NULL AND send_task_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notif_render_fail_delivery_open
+    ON notif_template_render_failures(delivery_id)
+    WHERE resolved_at IS NULL AND delivery_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_notif_render_fail_query
+    ON notif_template_render_failures(resolved_at, reason_code, recipient, event_type, channel);
+CREATE INDEX IF NOT EXISTS idx_notif_render_fail_task
+    ON notif_template_render_failures(send_task_id);
 """
 
 
@@ -1334,6 +1437,40 @@ class Database:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_notif_send_quota "
                 "ON notif_send_tasks(quota_version, quota_rule_id, recipient)")
+        # 通知内容模板编排：老库联系人补语言偏好、发送任务/旧投递补内容固化列
+        # （存量行视为无模板的静态正文，渲染器一律跳过，行为不变）。
+        if "approval_contacts" in tables:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(approval_contacts)")}
+            if "language" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE approval_contacts ADD COLUMN language TEXT")
+        if "notif_send_tasks" in tables:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(notif_send_tasks)")}
+            for name, ddl in (
+                ("template_snapshot", "TEXT"),
+                ("content_snapshot", "TEXT"),
+                ("content_sha256", "TEXT"),
+                ("render_status",
+                 "TEXT NOT NULL DEFAULT 'not_templated'"),
+                ("render_failure_reason", "TEXT"),
+            ):
+                if name not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE notif_send_tasks ADD COLUMN {name} {ddl}")
+        if "approval_notification_deliveries" in tables:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(approval_notification_deliveries)")}
+            for name, ddl in (
+                ("template_version_id", "INTEGER"),
+                ("template_language", "TEXT"),
+                ("content_sha256", "TEXT"),
+            ):
+                if name not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE approval_notification_deliveries "
+                        f"ADD COLUMN {name} {ddl}")
 
     @contextmanager
     def tx(self):
