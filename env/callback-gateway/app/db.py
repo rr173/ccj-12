@@ -1199,6 +1199,195 @@ CREATE INDEX IF NOT EXISTS idx_notif_render_fail_query
     ON notif_template_render_failures(resolved_at, reason_code, recipient, event_type, channel);
 CREATE INDEX IF NOT EXISTS idx_notif_render_fail_task
     ON notif_template_render_failures(send_task_id);
+
+-- ============================================================================
+-- 回执异常复核工作流（receipt exception review）
+-- ============================================================================
+
+-- 复核管理员名册（与 operator 同一命名空间）。role=reviewer 可认领/转派/备注/挂起，
+-- role=senior 额外可执行重试/抑制/重关联/标记送达/关闭；无活动名册行的操作者对
+-- 复核链路 fail-closed（读写均拒绝，除显式标注的公开引导外）。
+CREATE TABLE IF NOT EXISTS receipt_review_admins (
+    name        TEXT PRIMARY KEY,
+    role        TEXT NOT NULL,              -- reviewer | senior
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_by  TEXT NOT NULL,
+    note        TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    deactivated_at REAL
+);
+
+-- 复核案件：bounced/complained/expired/无法匹配的回执与确认超时自动建案，也可手工建案。
+-- case_key 去重单元（receipt:{id} 一回执最多一案；task-timeout:{task_id}:{message_pk}
+-- 同一超时消息一案）；同一 (subject,subject_id) 的多个回执证据可追加进同一案件。
+-- 案件行的关联列在证据追加时冗余补全（NULL 容忍），已落盘字段绝不被后续回执改写。
+CREATE TABLE IF NOT EXISTS receipt_review_cases (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_key      TEXT NOT NULL UNIQUE,
+    status        TEXT NOT NULL DEFAULT 'open',   -- open|in_progress|on_hold|resolved|closed
+    subject       TEXT NOT NULL,                  -- receipt | task
+    receipt_id    INTEGER REFERENCES receipts(id),
+    task_id       INTEGER REFERENCES notif_send_tasks(id),
+    delivery_id   INTEGER,                        -- 旧链路 approval_notification_deliveries.id
+    message_pk    INTEGER REFERENCES external_messages(id),
+    recipient     TEXT,
+    channel       TEXT,
+    message_id    TEXT,                           -- 外部消息编号（查询锚点）
+    event_type    TEXT,                           -- bounced|complained|expired|unmatched|confirmation_timeout
+    source        TEXT NOT NULL DEFAULT 'auto',   -- auto | manual
+    priority      TEXT NOT NULL DEFAULT 'normal', -- low|normal|high
+    owner         TEXT,                           -- 当前认领人（NULL=待认领）
+    owned_at      REAL,
+    assigned_by   TEXT,
+    note          TEXT,                           -- 最近处理意见（完整意见在 decisions 追加留痕）
+    sla_deadline  REAL,                           -- 当前 SLA 截止（建案/升级时顺延）
+    escalation_level INTEGER NOT NULL DEFAULT 0,
+    last_escalated_at REAL,
+    resolution    TEXT,                           -- 最终处置动作：retried|suppressed|relinked|
+                                                  -- marked_delivered|closed_*
+    resolved_by   TEXT,
+    resolved_at   REAL,
+    closed_by     TEXT,
+    closed_at     REAL,
+    close_reason  TEXT,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_cases_status ON receipt_review_cases(status, sla_deadline);
+CREATE INDEX IF NOT EXISTS idx_review_cases_owner ON receipt_review_cases(owner, status);
+CREATE INDEX IF NOT EXISTS idx_review_cases_query
+    ON receipt_review_cases(recipient, event_type, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_cases_receipt ON receipt_review_cases(receipt_id);
+CREATE INDEX IF NOT EXISTS idx_review_cases_task ON receipt_review_cases(task_id);
+CREATE INDEX IF NOT EXISTS idx_review_cases_message ON receipt_review_cases(message_pk);
+
+-- 不可变证据快照：建案时按接收人/事件/原始消息固化，之后绝不更新（新事实=追加新行）。
+-- kind=receipt 回执原文行+哈希；kind=message 外部消息登记；kind=task 发送任务；
+-- kind=history 状态历史；kind=manual 管理员手工补充（可带附件）。
+CREATE TABLE IF NOT EXISTS receipt_review_evidence (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id     INTEGER NOT NULL REFERENCES receipt_review_cases(id),
+    kind        TEXT NOT NULL,                  -- receipt|message|task|history|delivery|manual
+    ref_type    TEXT,                           -- receipts|external_messages|notif_send_tasks|...
+    ref_id      INTEGER,
+    title       TEXT,
+    content_sha256 TEXT,                        -- 快照内容哈希（清理后仍可校验摘要）
+    snapshot_json TEXT NOT NULL,
+    added_by    TEXT NOT NULL,                  -- 'system' 或管理员
+    attachment_id INTEGER,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_evidence_case ON receipt_review_evidence(case_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_evidence_ref
+    ON receipt_review_evidence(case_id, kind, ref_type, ref_id)
+    WHERE ref_id IS NOT NULL;
+
+-- 案件决定（只增）：认领/转派/备注/挂起/恢复/重试/抑制/重关联/标记送达/解决/关闭全部落一行，
+-- 每个决定带原因（effect 动作必填），并回写原通知状态。外部效果动作每案件每类至多一条
+-- （部分唯一索引：重复操作返回原决定，绝不产生第二次外部效果，也不覆盖已有决定）。
+CREATE TABLE IF NOT EXISTS receipt_review_decisions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id     INTEGER NOT NULL REFERENCES receipt_review_cases(id),
+    request_id  TEXT,                            -- 提交幂等键（全局唯一，重复提交返回原决定）
+    action      TEXT NOT NULL,                   -- claim|assign|note|suspend|resume|
+                                                 -- retry_send|suppress|relink_task|
+                                                 -- mark_delivered|resolve|reopen|close
+    operator    TEXT NOT NULL,
+    reason      TEXT,
+    note        TEXT,
+    status      TEXT NOT NULL DEFAULT 'applied', -- applied|noop|failed
+    effect      TEXT,                            -- none|send_scheduled|suppressed|relinked|marked_delivered
+    target_type TEXT,                            -- task|receipt|message|suppression|case
+    target_id   INTEGER,
+    from_status TEXT,
+    to_status   TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}',      -- 前后状态/依据/错误等
+    created_at  REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_decisions_request
+    ON receipt_review_decisions(request_id) WHERE request_id IS NOT NULL;
+-- 每案件每个外部效果动作至多一条已应用决定（重试/抑制/重关联/标记送达不可对同案重复生效）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_decisions_effect_once
+    ON receipt_review_decisions(case_id, action)
+    WHERE action IN ('retry_send','suppress','relink_task','mark_delivered')
+      AND status='applied';
+CREATE INDEX IF NOT EXISTS idx_review_decisions_case
+    ON receipt_review_decisions(case_id, id);
+
+-- SLA 升级记录：每次到点升级落一行（同案件同级别唯一，重启/重复扫描不重复升级）。
+CREATE TABLE IF NOT EXISTS receipt_review_escalations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id     INTEGER NOT NULL REFERENCES receipt_review_cases(id),
+    level       INTEGER NOT NULL,
+    reason      TEXT NOT NULL,                  -- sla_due
+    from_owner  TEXT,
+    notified_roles TEXT NOT NULL DEFAULT '[]',  -- 升级通知角色快照（站内待办，无外发效果）
+    old_deadline REAL,
+    new_deadline REAL,
+    created_at  REAL NOT NULL,
+    UNIQUE (case_id, level)
+);
+CREATE INDEX IF NOT EXISTS idx_review_escalations_case
+    ON receipt_review_escalations(case_id, id);
+
+-- 后续发送抑制名单：案件决定 suppress 时写入；领取（admit）/重试调度/计划重开时校验，
+-- 命中即取消待发送任务（已发出的外部效果轨迹保留）。可按接收人（event_type NULL）
+-- 或接收人×事件类型抑制；解除由终态案件关闭时自动放行，亦可手工解除（单独决定留痕）。
+CREATE TABLE IF NOT EXISTS receipt_review_suppressions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id     INTEGER NOT NULL REFERENCES receipt_review_cases(id),
+    recipient   TEXT NOT NULL,
+    event_type  TEXT,                           -- NULL=该接收人的后续通知一律抑制
+    reason      TEXT NOT NULL,
+    created_by  TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active', -- active | released
+    released_at REAL,
+    released_by TEXT,
+    release_reason TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_suppression_active
+    ON receipt_review_suppressions(recipient, COALESCE(event_type, '*'))
+    WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_review_suppression_query
+    ON receipt_review_suppressions(recipient, event_type, status);
+
+-- 案件临时附件（管理员补充的二进制证据）：内容哈希随证据快照固化；案件关闭后可安全
+-- 清理 blob（置 purged），证据行的摘要/哈希/决定/审计全部保留，历史不被改写。
+CREATE TABLE IF NOT EXISTS receipt_review_attachments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id       INTEGER NOT NULL REFERENCES receipt_review_cases(id),
+    filename      TEXT NOT NULL,
+    content_type  TEXT,
+    size_bytes    INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    blob          TEXT,                         -- base64 原文；清理后置 NULL
+    status        TEXT NOT NULL DEFAULT 'stored', -- stored | purged
+    uploaded_by   TEXT NOT NULL,
+    purged_at     REAL,
+    purged_by     TEXT,
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_attachments_case
+    ON receipt_review_attachments(case_id, id);
+
+-- 复核 SLA 策略（单例行 id=1）：建案后多少秒首限；每次升级顺延多少秒；最多升级级别
+-- （0=关闭自动升级）；达到最高级后案件置 high 优先级等待 senior 处置。
+CREATE TABLE IF NOT EXISTS receipt_review_policy (
+    id            INTEGER PRIMARY KEY CHECK (id=1),
+    sla_seconds   REAL NOT NULL,
+    escalation_seconds REAL NOT NULL,
+    max_escalation_level INTEGER NOT NULL,
+    updated_by    TEXT NOT NULL,
+    updated_at    REAL NOT NULL,
+    reason        TEXT
+);
+INSERT OR IGNORE INTO receipt_review_policy
+    (id, sla_seconds, escalation_seconds, max_escalation_level,
+     updated_by, updated_at, reason)
+VALUES (1, 14400, 7200, 2, 'bootstrap', 0, 'default');
 """
 
 
