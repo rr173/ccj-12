@@ -33,6 +33,9 @@ from .notif_routing import configure_routing, create_routing_router
 from .notif_templates import create_templates_router
 from .notifications import create_notifications_router
 from . import receipts
+from .orchestration.admin import create_orchestration_router
+from .orchestration.engine import OrchestrationEngine
+from .orchestration.worker import OrchestrationWorker
 from .receipt_review import create_review_router
 from .receipts import create_receipts_admin_router, create_receipts_public_router
 from .replay import ReplayWorker, create_replay_router
@@ -54,6 +57,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     worker = Worker(db, settings)
     replay_worker = ReplayWorker(db, settings)
     notif_worker = NotificationWorker(db, settings)
+    # 跨回调因果编排：图版本化、就绪级联、汇合、期限扫描、人工处置
+    orch_engine = OrchestrationEngine(db)
+    orch_worker = OrchestrationWorker(
+        orch_engine, db, poll_interval=settings.worker_poll_interval)
     # 通知通道路由：在业务事务内入队时读取的默认熔断/超时配置
     configure_routing(settings)
     # 外部回执：引导按通道验签密钥（环境变量）与确认策略缺省
@@ -65,15 +72,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         replay_worker.recover()
         # 通知路由：卡在 in_flight 的发送任务退回 pending（尝试/熔断状态都在库里）
         notif_worker.recover()
+        # 编排：重算全部活动实例的就绪状态（绝不重复执行已完成节点/不重复产生副作用）
+        orch_engine.recover()
         tasks = []
         if settings.run_worker:
             tasks.append(asyncio.create_task(worker.run_forever()))
             tasks.append(asyncio.create_task(replay_worker.run_forever()))
             tasks.append(asyncio.create_task(notif_worker.run_forever()))
+            tasks.append(asyncio.create_task(orch_worker.run_forever()))
         yield
         worker.stop()
         replay_worker.stop()
         notif_worker.stop()
+        orch_worker.stop()
         for task in tasks:
             await task
         db.close()
@@ -85,6 +96,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.worker = worker
     app.state.replay_worker = replay_worker
     app.state.notif_worker = notif_worker
+    app.state.orch_engine = orch_engine
+    app.state.orch_worker = orch_worker
     app.state.settings = settings
 
     @app.post("/callbacks")
@@ -138,6 +151,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(create_receipts_admin_router(db, settings))
     # 回执失败复核案件：bounced 等回执自动建案 + 管理员查案/证据
     app.include_router(create_review_router(db))
+    # 跨回调因果编排：图版本发布/回滚、回调级联、汇合、期限异常、人工处置
+    app.include_router(create_orchestration_router(db, orch_engine))
     return app
 
 

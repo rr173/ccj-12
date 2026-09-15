@@ -1284,3 +1284,34 @@ curl 'localhost:8000/$BASE/send-plans?task_id=32'
   `receipt_status_history`/`receipt_keys`/`receipt_policy` 表，并给
   `notif_send_tasks` 与 `approval_notification_deliveries` 补回执状态列（存量任务
   为 `not_required`/NULL，行为与升级前完全一致；升级后新发送成功才登记 message_id）。
+
+## 跨回调因果编排（orchestration）
+
+`app/orchestration/` 为一种业务流程（process_type）发布**事件依赖图**并驱动流程实例：
+
+- **图发布校验**（`model.build_graph`）：节点 code 唯一、`depends_on` 引用必须存在、
+  DAG 无环、从根节点不可达的节点拒绝、`key_path`（点分段，支持 `a.b[0].c`）语法校验、
+  `occurrences>=1`、`join ∈ {ALL,ANY}`；失败留 rejected 版本记录且不推进当前指针。
+- **版本固定**：每个实例创建时固化 `graph_version_id`，之后发布/回滚只改
+  `orch_graph_current` 指针，只影响新实例；实例始终按自己的快照识别节点与依赖。
+- **乱序与级联**：回调先落 `orch_callbacks`（WAITING 持久化等待），`_advance_locked`
+  在单个写事务内迭代到不动点，前置完成后**原子释放**所有刚就绪后继并同事务处理；
+  ALL 汇合等全部分支，ANY 汇合任一分支完成即释放且只释放一次。
+- **幂等与冲突**：同实例同节点同内容重复回调只追加 duplicate 记录；内容不同的版本数
+  超过 occurrences 打开冲突，未选定前不推进；人工选定后冻结不可改选；节点完成后的
+  新版本登记为完成后冲突（效果不撤回、业务绝不二次执行）。
+- **失败隔离**：业务处理器异常只把该节点置 BLOCKED（指数退避），独立分支继续；
+  重试/人工选定/重启都重算就绪，状态条件转移 + `orch_effects.idempotency_key`
+  唯一键 + 下游幂等 sink 三重保证「不重复执行、不越过前置、不重复外部效果」。
+- **期限异常**：节点 `wait_seconds` 到期缺前置（missing_prerequisite）或缺回调
+  （missing_callback）时生成可查询异常，列出受阻分支（后继依赖路径）与最后期限；
+  回调到达/跳过后同事务关闭。
+- **人工处置**：orphan（关联键错误/无活动实例的非根回调）可重关联到实例节点
+  （原 orphan 行保留，新 bound 行带 `bound_from_callback_id` 归属链）；`required`
+  节点不能跳过；终止实例后未完成节点 TERMINATED、开放异常 voided，迟到回调只记 late。
+- **并发单结果**：全部写操作走 BEGIN IMMEDIATE 串行事务，open 异常、活动实例、
+  重关联绑定均有部分唯一索引兜底；`tests/orchestration/test_concurrency.py`
+  覆盖扫描/回调/重关联/终止并发。
+- **可观测**：`GET /admin/orchestration/instances/{key}` 返回五档节点
+  （completed/processing/waiting/blocked/not_arrived）、每节点实际采用回调版本、
+  阻塞原因、未完成前置、根到节点依赖路径、异常列表与实例内按 seq 有序的审计轨迹。
